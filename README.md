@@ -3,6 +3,8 @@
 A Streamlit custom component for [lonboard](https://github.com/developmentseed/lonboard) — fast, GPU-accelerated geospatial visualization in Streamlit, powered by [deck.gl](https://deck.gl) and [GeoArrow](https://geoarrow.org).
 
 > **Status: early development.** Scatterplot/Path/Polygon/SolidPolygon layers, multi-layer maps, click/hover picking, and view-state persistence across reruns all work. Heatmap is wired but untested; Bitmap/Raster layers aren't supported yet. See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for the roadmap and progress.
+>
+> **Requires Python <3.14 and pyarrow <20** (both enforced in `pyproject.toml`). Newer pyarrow has an intermittent native segfault converting GeoDataFrames to Arrow from a background thread — exactly how Streamlit runs your script — and 3.14 forces that pyarrow version since no older one ships a wheel for it. See the comments next to `requires-python`/`pyarrow` in [pyproject.toml](./pyproject.toml).
 
 ## Why?
 

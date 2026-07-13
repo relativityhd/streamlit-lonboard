@@ -141,6 +141,7 @@ def st_lonboard(
 | Lonboard internal APIs (traitlet extraction) change | Breakage on lonboard upgrades          | Depend on public attrs where possible; pin compatible range; CI against lonboard main |
 | Rerun-triggered re-transfer of large data           | Perf regression vs Jupyter             | Content-hash caching both sides (Phase 4)                                             |
 | View-state feedback loop (report → rerun → reset)   | Janky UX                               | Frontend owns view state; Python override only on explicit change                     |
+| pyarrow 25.0.0 native segfault in pandas/GeoDataFrame→Arrow conversion, called from a background thread (found while debugging "dev server crashes when panning" - `return_view_state=True` reruns hit it within a few reruns, racy rather than deterministic) | Crashes the whole Python process, no traceback unless `PYTHONFAULTHANDLER=1` | Pin `pyarrow<20` (verified clean across 100+ stress-test reruns) and `requires-python<3.14` (3.14 has no wheels for any older pyarrow) in `pyproject.toml` |
 
 ## 6. Repo layout
 

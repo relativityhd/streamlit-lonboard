@@ -3,8 +3,11 @@
   "configurations": [
     {
       "name": "streamlit-demo",
-      "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "streamlit", "run", "examples/app.py", "--server.headless", "true"],
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 uv run streamlit run examples/app.py --server.headless true"
+      ],
       "port": 8501
     }
   ]
