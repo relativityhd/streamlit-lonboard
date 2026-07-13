@@ -8,12 +8,13 @@ version = "0.1.0.dev0"
 description = "Streamlit component for lonboard: fast GeoArrow/deck.gl maps without GeoJSON"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "Tobias Hoelzer" }]
 keywords = ["streamlit", "lonboard", "deckgl", "geoarrow", "geospatial"]
 dependencies = [
-    # TODO(phase-0): pin exact minimum Streamlit version that ships components v2
-    "streamlit>=1.49",
+    # Phase 0 spike: CCv2 as used here (st.components.v2, bidi_component data=bytes)
+    # verified against streamlit==1.59.2. Older 1.49-1.58 may work but are untested.
+    "streamlit>=1.59",
     "lonboard>=0.10",
     "pyarrow>=14",
 ]
@@ -27,3 +28,8 @@ Issues = "https://github.com/relativityhd/streamlit-lonboard/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/streamlit_lonboard"]
+
+# Also mirrored in src/streamlit_lonboard/pyproject.toml - see the comment
+# there for why (CCv2's manifest scanner can't see this file for a src/ layout).
+[tool.streamlit.component]
+components = [{ name = "lonboard_map", asset_dir = "frontend_dist" }]

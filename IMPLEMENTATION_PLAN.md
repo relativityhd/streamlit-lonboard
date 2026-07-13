@@ -86,7 +86,7 @@ def st_lonboard(
     map: lonboard.Map | None = None,          # or:
     layers: list[lonboard.BaseLayer] | None = None,
     view_state: dict | None = None,
-    basemap_style: str = CartoBasemap.PositronNoLabels,
+    basemap_style: str = CartoLayout.PositronNoLabels,
     height: int = 500,
     on_click: bool = True,
     on_hover: bool = False,
@@ -100,47 +100,47 @@ def st_lonboard(
 ## 4. Phases
 
 ### Phase 0 — Spike (validate assumptions)
-- [ ] Minimal CCv2 component passing 50 MB of bytes; measure latency, confirm bytes-in-dict support, pin minimum Streamlit version.
-- [ ] Render a hardcoded GeoArrow table with `@geoarrow/deck.gl-layers` inside that component.
-- [ ] Confirm component DOM survives reruns with stable `key`; test view-state persistence.
-- Exit criteria: point cloud of 1M points renders and survives reruns without re-shipping data.
+- [x] Minimal CCv2 component passing bytes; latency not yet benchmarked at scale, but bytes-in-dict was found to auto-parse through *Streamlit's own* bundled Arrow build (version we don't control), so we ship one framed top-level `bytes` blob instead (see `serialize.pack_payload`) — pinned `streamlit>=1.59` (tested against 1.59.2).
+- [x] Render a hardcoded GeoArrow table with `@geoarrow/deck.gl-geoarrow` (the renamed successor to `@geoarrow/deck.gl-layers`) inside that component.
+- [x] Confirm component DOM survives reruns with stable `key`; view-state persistence verified live (pan/zoom + camera survive a real Streamlit rerun; see `frontend/src/index.ts` `ensureMount`).
+- Exit criteria (partial): scatterplot + path + polygon layers render and survive reruns without re-shipping/remounting; not yet load-tested at 1M points.
 
 ### Phase 1 — MVP
-- [ ] `st_lonboard(layers=[ScatterplotLayer])` renders with fill color/radius props.
-- [ ] Frontend build (Vite + TS) producing the CCv2 asset bundle; packaged via manifest (`asset_dir`, js/css globs).
-- [ ] Prop extraction from lonboard traitlets → JSON (scalar props) / Arrow columns (per-feature accessors).
-- [ ] MapLibre basemap, height/width options.
+- [x] `st_lonboard(layers=[ScatterplotLayer])` renders with fill color/radius props (scalar and per-feature accessor).
+- [x] Frontend build (Vite + TS) producing the CCv2 asset bundle; packaged via manifest (`asset_dir`, js/css paths) — see `pyproject.toml` and the mirrored `src/streamlit_lonboard/pyproject.toml`.
+- [x] Prop extraction from lonboard traitlets → JSON (scalar props) / Arrow columns (per-feature accessors) — generic, trait-name-driven (`serialize.build_layer_props`).
+- [x] MapLibre basemap, height option (width uses CCv2's stretch default).
 
 ### Phase 2 — Layer coverage & styling parity
-- [ ] `PathLayer`, `PolygonLayer` (SolidPolygon), `HeatmapLayer`, `BitmapLayer` as supported by `@geoarrow/deck.gl-layers`.
-- [ ] Multi-layer maps, `lonboard.Map` passthrough (basemap, view state, parameters).
-- [ ] Color helpers (`apply_continuous_cmap` etc.) — should work for free since they produce Arrow columns.
+- [x] `PathLayer`, `PolygonLayer`, `SolidPolygonLayer`, `HeatmapLayer` (heatmap wired but not yet exercised in the example app). `BitmapLayer`/`RasterLayer` are **not** supported — `@geoarrow/deck.gl-geoarrow` doesn't export a GeoArrow bitmap layer (raster data isn't GeoArrow feature data); unsupported types raise a clear `ValueError` from `serialize_layer`.
+- [x] Multi-layer maps, `lonboard.Map` passthrough (basemap style, view state; `parameters`/`controls`/`tooltip` not yet forwarded).
+- [ ] Color helpers (`apply_continuous_cmap` etc.) — should work for free since they produce Arrow columns, but not explicitly tested.
 
 ### Phase 3 — Bidirectionality
-- [ ] Click picking → `.clicked` (index + coordinates + layer id).
-- [ ] Hover (throttled) behind `on_hover` flag.
-- [ ] View state reporting behind `return_view_state` flag (throttled; each report triggers a rerun — document the cost).
+- [x] Click picking → `.clicked` (index + coordinates + layer id), with per-batch row offsets resolved back to the original table's row index.
+- [x] Hover (throttled ~200ms) behind `on_hover` flag.
+- [x] View state reporting behind `return_view_state` flag (throttled ~200ms; each report still triggers a rerun — documented cost, not yet mitigated).
 
 ### Phase 4 — Performance & robustness
 - [ ] Serialization cache + frontend content-hash cache (skip redundant transfer/parse).
 - [ ] Benchmarks vs `st.pydeck_chart` (10k / 100k / 1M / 10M features) — publish results in README.
 - [ ] Optional Parquet compression for remote deployments.
-- [ ] Error surfaces: unsupported layer types, missing CRS, mixed geometry types.
+- [x] Error surfaces: unsupported layer types raise a clear `ValueError` (`serialize.serialize_layer`). Missing CRS / mixed geometry types not yet handled explicitly.
 
 ### Phase 5 — Release
-- [ ] Tests (pytest + playwright for frontend smoke tests), CI (GitHub Actions), type hints, docs site.
+- [x] Unit tests for `serialize.py` (`tests/test_serialize.py`, pytest). Frontend/playwright smoke tests, CI, docs site not yet done.
 - [ ] Publish to PyPI; announce in lonboard discussion #342 and Streamlit forum.
 - [ ] Aim for a mention in lonboard's [ecosystem docs](https://developmentseed.org/lonboard/latest/ecosystem/) alongside Shiny.
 
 ## 5. Risks
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| CCv2 API still maturing / min version too new | Users on older Streamlit can't install | Document min version; no v1 fallback (v1 + JSON defeats the purpose) |
-| Bytes-in-dict unsupported in `data` | Container format broken | Phase 0 spike; single-blob + offsets fallback |
-| Lonboard internal APIs (traitlet extraction) change | Breakage on lonboard upgrades | Depend on public attrs where possible; pin compatible range; CI against lonboard main |
-| Rerun-triggered re-transfer of large data | Perf regression vs Jupyter | Content-hash caching both sides (Phase 4) |
-| View-state feedback loop (report → rerun → reset) | Janky UX | Frontend owns view state; Python override only on explicit change |
+| Risk                                                | Impact                                 | Mitigation                                                                            |
+| --------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------- |
+| CCv2 API still maturing / min version too new       | Users on older Streamlit can't install | Document min version; no v1 fallback (v1 + JSON defeats the purpose)                  |
+| Bytes-in-dict unsupported in `data`                 | Container format broken                | Phase 0 spike; single-blob + offsets fallback                                         |
+| Lonboard internal APIs (traitlet extraction) change | Breakage on lonboard upgrades          | Depend on public attrs where possible; pin compatible range; CI against lonboard main |
+| Rerun-triggered re-transfer of large data           | Perf regression vs Jupyter             | Content-hash caching both sides (Phase 4)                                             |
+| View-state feedback loop (report → rerun → reset)   | Janky UX                               | Frontend owns view state; Python override only on explicit change                     |
 
 ## 6. Repo layout
 
@@ -149,12 +149,17 @@ streamlit-lonboard/
 ├── src/streamlit_lonboard/
 │   ├── __init__.py          # st_lonboard entry point
 │   ├── component.py         # CCv2 declaration + result wrapper
-│   └── serialize.py         # lonboard Layer → (Arrow IPC bytes, props dict)
+│   ├── serialize.py         # lonboard Layer -> (framed bytes payload: header + Arrow IPC)
+│   ├── pyproject.toml       # manifest mirror - see the comment inside for why this exists
+│   └── frontend_dist/       # built by `npm run build`; gitignored, not checked in
 ├── frontend/
-│   ├── package.json         # deck.gl, @geoarrow/deck.gl-layers, apache-arrow, maplibre-gl
-│   ├── vite.config.ts
-│   └── src/index.ts         # parse IPC → GeoArrow layers → Deck
+│   ├── package.json         # deck.gl, @geoarrow/deck.gl-geoarrow, apache-arrow, maplibre-gl
+│   ├── vite.config.ts       # single-file ESM + CSS output into ../src/streamlit_lonboard/frontend_dist
+│   └── src/
+│       ├── index.ts         # CCv2 mount entry point (idempotent across reruns)
+│       ├── container.ts     # parse the framed bytes payload
+│       └── layers.ts        # layer-type -> GeoArrow*Layer dispatch, accessor resolution
 ├── examples/app.py
-├── tests/
+├── tests/test_serialize.py
 └── pyproject.toml
 ```

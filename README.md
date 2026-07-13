@@ -2,7 +2,7 @@
 
 A Streamlit custom component for [lonboard](https://github.com/developmentseed/lonboard) — fast, GPU-accelerated geospatial visualization in Streamlit, powered by [deck.gl](https://deck.gl) and [GeoArrow](https://geoarrow.org).
 
-> **Status: early development.** See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for the roadmap.
+> **Status: early development.** Scatterplot/Path/Polygon/SolidPolygon layers, multi-layer maps, click/hover picking, and view-state persistence across reruns all work. Heatmap is wired but untested; Bitmap/Raster layers aren't supported yet. See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for the roadmap and progress.
 
 ## Why?
 
@@ -28,7 +28,7 @@ lonboard Map/Layers (Python)          frontend (TypeScript)
 
 Data crosses the Python↔browser boundary as raw Arrow IPC bytes via Streamlit's [custom components v2](https://docs.streamlit.io/develop/concepts/custom-components/components-v2) — no GeoJSON anywhere in the pipeline.
 
-## Planned API
+## API
 
 ```python
 import geopandas as gpd
@@ -45,13 +45,22 @@ st.write("Clicked feature index:", result.clicked)
 
 ## Development
 
-```bash
-# Python
-pip install -e ".[dev]"
+The frontend must be built before the Python package will render anything
+(its assets live in `src/streamlit_lonboard/frontend_dist/`, which is
+gitignored):
 
-# Frontend
+```bash
+# Frontend (build first - the Python package serves this output)
 cd frontend && npm install && npm run build
+
+# Python
+cd ..
+pip install -e ".[dev]"
+streamlit run examples/app.py
 ```
+
+Re-run `npm run build` (or `npm run dev` for a watch build) after any
+frontend change and refresh the browser tab.
 
 ## License
 

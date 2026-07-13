@@ -4,4 +4,5 @@ dist/
 .venv/
 node_modules/
 frontend/dist/
+src/streamlit_lonboard/frontend_dist/
 .streamlit/

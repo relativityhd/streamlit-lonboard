@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "streamlit-demo",
+      "runtimeExecutable": ".venv/bin/streamlit",
+      "runtimeArgs": ["run", "examples/app.py", "--server.headless", "true"],
+      "port": 8501
+    }
+  ]
+}

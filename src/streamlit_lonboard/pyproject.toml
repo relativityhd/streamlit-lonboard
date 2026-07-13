@@ -1,0 +1,20 @@
+# Mirror of the [tool.streamlit.component] manifest from the repo-root
+# pyproject.toml, duplicated here on purpose.
+#
+# Streamlit's CCv2 manifest scanner (component_manifest_handler / manifest_scanner)
+# only looks for pyproject.toml directly inside a package's directory or that
+# directory's *immediate* parent (via importlib's spec origin). For a `src/`
+# layout, the real pyproject.toml lives two levels above
+# `src/streamlit_lonboard/__init__.py`, which the scanner never reaches - so
+# without this copy, `asset_dir` (and therefore the frontend JS/CSS) is never
+# discovered, in both editable and regular installs.
+#
+# Keep `[project].name` and `[tool.streamlit.component]` here in sync with the
+# root pyproject.toml if either changes.
+[project]
+name = "streamlit-lonboard"
+
+[tool.streamlit.component]
+components = [
+    { name = "lonboard_map", asset_dir = "frontend_dist" },
+]
