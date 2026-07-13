@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "streamlit-lonboard"
+version = "0.1.0.dev0"
+description = "Streamlit component for lonboard: fast GeoArrow/deck.gl maps without GeoJSON"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "Tobias Hoelzer" }]
+keywords = ["streamlit", "lonboard", "deckgl", "geoarrow", "geospatial"]
+dependencies = [
+    # TODO(phase-0): pin exact minimum Streamlit version that ships components v2
+    "streamlit>=1.49",
+    "lonboard>=0.10",
+    "pyarrow>=14",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "geopandas", "ruff"]
+
+[project.urls]
+Repository = "https://github.com/relativityhd/streamlit-lonboard"
+Issues = "https://github.com/relativityhd/streamlit-lonboard/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/streamlit_lonboard"]
