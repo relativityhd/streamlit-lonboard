@@ -107,7 +107,7 @@ def st_lonboard(
 
 ### Phase 1 — MVP
 - [x] `st_lonboard(layers=[ScatterplotLayer])` renders with fill color/radius props (scalar and per-feature accessor).
-- [x] Frontend build (Vite + TS) producing the CCv2 asset bundle; packaged via manifest (`asset_dir`, js/css paths) — see `pyproject.toml` and the mirrored `src/streamlit_lonboard/pyproject.toml`.
+- [x] Frontend build (Vite + TS) producing the CCv2 asset bundle; packaged via manifest (`asset_dir`, js/css paths) — see `pyproject.toml` and the mirrored `src/streamlit_lonboard/pyproject.toml`. Automated via a Hatchling build hook (`hatch_build.py`) that runs `npm install && npm run build` on `uv sync`/`uv build`; verified a wheel built this way installs and renders with zero Node/source-tree access (`artifacts` in `[tool.hatch.build.targets.wheel]` force-includes the gitignored `frontend_dist/` output).
 - [x] Prop extraction from lonboard traitlets → JSON (scalar props) / Arrow columns (per-feature accessors) — generic, trait-name-driven (`serialize.build_layer_props`).
 - [x] MapLibre basemap, height option (width uses CCv2's stretch default).
 

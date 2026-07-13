@@ -28,6 +28,15 @@ Issues = "https://github.com/relativityhd/streamlit-lonboard/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/streamlit_lonboard"]
+# frontend_dist/ is gitignored (it's a build artifact - see hatch_build.py), so
+# hatchling's default VCS-aware file selection excludes it; `artifacts` forces
+# it back in despite that.
+artifacts = ["src/streamlit_lonboard/frontend_dist/**"]
+
+# Builds frontend/ into src/streamlit_lonboard/frontend_dist/ automatically
+# for `uv build`/`uv sync`/`pip install [-e] .` - see hatch_build.py.
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
 
 # Also mirrored in src/streamlit_lonboard/pyproject.toml - see the comment
 # there for why (CCv2's manifest scanner can't see this file for a src/ layout).

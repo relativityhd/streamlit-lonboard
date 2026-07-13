@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "streamlit-demo",
-      "runtimeExecutable": ".venv/bin/streamlit",
-      "runtimeArgs": ["run", "examples/app.py", "--server.headless", "true"],
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "streamlit", "run", "examples/app.py", "--server.headless", "true"],
       "port": 8501
     }
   ]

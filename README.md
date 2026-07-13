@@ -45,22 +45,28 @@ st.write("Clicked feature index:", result.clicked)
 
 ## Development
 
-The frontend must be built before the Python package will render anything
-(its assets live in `src/streamlit_lonboard/frontend_dist/`, which is
-gitignored):
+Managed with [uv](https://docs.astral.sh/uv/). A [Hatchling build
+hook](hatch_build.py) runs `npm install && npm run build` automatically
+whenever the package is built or synced, so `uv sync`/`uv build` produce a
+wheel with the frontend already bundled into
+`src/streamlit_lonboard/frontend_dist/` (gitignored source-tree-side; only
+Node is required to build it, not to install the published wheel):
 
 ```bash
-# Frontend (build first - the Python package serves this output)
-cd frontend && npm install && npm run build
-
-# Python
-cd ..
-pip install -e ".[dev]"
-streamlit run examples/app.py
+uv sync --extra dev
+uv run streamlit run examples/app.py
 ```
 
-Re-run `npm run build` (or `npm run dev` for a watch build) after any
-frontend change and refresh the browser tab.
+If you edit the frontend, run `cd frontend && npm run dev` (watch build) or
+`npm run build` (one-off) yourself and refresh the browser tab — the build
+hook only runs when the package itself is (re)built (`uv sync`/`uv build`),
+not on every `uv run`.
+
+```bash
+uv build          # sdist + wheel into dist/
+uv run pytest     # tests/test_serialize.py
+uv run ruff check # lint
+```
 
 ## License
 
