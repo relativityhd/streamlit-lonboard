@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import streamlit as st
 import streamlit.components.v2 as components
 from lonboard import Map
 from lonboard.basemap import CartoStyle
 
 from ._perf import perf_enabled, span
-from .serialize import Compression, pack_payload, serialize_layer_cached
+from .serialize import Compression, check_payload_size, pack_payload, serialize_layer_cached
 
 # Fully-qualified name = "<project name from pyproject.toml>.<[tool.streamlit.component] entry>".
 _COMPONENT_NAME = "streamlit-lonboard.lonboard_map"
@@ -61,7 +62,10 @@ def st_lonboard(
     Pass a stable `key` if you want the user's pan/zoom to survive Streamlit
     reruns triggered by unrelated widgets elsewhere in the app — without one,
     the component's identity is derived from the serialized data and may
-    remount when that data changes.
+    remount when that data changes. A `key` is also *required* (Streamlit will
+    raise `StreamlitDuplicateElementId`) if your app calls `st_lonboard()`
+    more than once with byte-identical arguments in the same script run —
+    same as any other Streamlit element.
 
     `compression` controls gzip compression of the Arrow payload:
     - `"auto"` (default): compress only above
@@ -102,6 +106,7 @@ def st_lonboard(
             },
             compression=compression,
         )
+        check_payload_size(payload, max_mb=st.get_option("server.maxMessageSize"))
 
         callbacks: dict[str, Any] = {}
         if on_click:

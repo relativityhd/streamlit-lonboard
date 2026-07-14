@@ -296,24 +296,76 @@ layers — and rebuilds every layer instead of just the changed one.
 #### 4e — Robustness & error surfaces
 
 - [x] Unsupported layer types raise a clear `ValueError` (`serialize.serialize_layer`).
-- [ ] Payload size guard: fail in Python with an actionable message when the
+- [x] Payload size guard: fail in Python with an actionable message when the
   payload exceeds Streamlit's `server.maxMessageSize` (default 200 MB) instead
   of letting the WebSocket die opaquely; mention the config knob and
-  downsampling in the error text.
-- [ ] CRS: warn when a layer's geometry column has no CRS or a non-EPSG:4326
-  CRS in its GeoArrow extension metadata (deck.gl assumes lon/lat WGS84;
-  lonboard's `from_geopandas` reprojects, but raw-table construction doesn't).
-- [ ] Geometry edge cases with tests: empty table (0 rows), null geometries,
+  downsampling in the error text. Implemented as `serialize.check_payload_size`,
+  called from `st_lonboard()` with the live `server.maxMessageSize` option;
+  tested in `tests/test_serialize.py` and live-verified with an artificially
+  low limit.
+- [x] CRS: investigated whether to warn on missing/non-EPSG:4326 CRS in a
+  layer's GeoArrow extension metadata. **Finding: not needed, and not added.**
+  This plan originally assumed "`from_geopandas` reprojects, but raw-table
+  construction doesn't" — that's wrong. Reprojection to EPSG:4326 (with
+  lonboard's own `warnings.warn`) happens unconditionally in
+  `BaseArrowLayer.__init__` (`reproject_table(table_o3, to_crs=OGC_84)`,
+  called before the default-viewport calculation), regardless of whether the
+  layer was built via `from_geopandas` or directly from a raw Arrow table.
+  Verified by round-tripping real coordinates through EPSG:3857 into a raw
+  table and confirming both the warning fires and the stored coordinates come
+  back out in degrees. Since every lonboard layer object is therefore
+  guaranteed to already carry EPSG:4326 geometry by the time it reaches
+  `serialize_layer()`, our own CRS check would be unreachable defensive code
+  for a scenario that cannot occur.
+- [x] Geometry edge cases with tests: empty table (0 rows), null geometries,
   Point vs MultiPoint in one dataset (GeoArrow columns are homogeneous by
   construction, so this is about verifying the Multi* variants render, not
   about mixed columns).
-- [ ] Frontend errors: wrap per-layer build in try/catch so one bad layer
+  - Empty table (0 rows): rejected by **lonboard itself** at layer
+    construction (`from_geopandas` raises "Geometry type combination is not
+    supported ([])") before a layer object even exists, so `serialize_layer`
+    never sees it. Nothing for us to handle.
+  - Null geometries: `serialize_layer` handles these fine (row kept as-is).
+    But mixing a null geometry into a layer's geometry column makes
+    lonboard's own auto-computed view state come back as `nan`/`nan`
+    (`Map.view_state`'s centroid/bbox math propagates NaN through nulls
+    rather than skipping them). `json.dumps` then emits a bare `NaN` token,
+    which is invalid JSON and crashed the frontend's `JSON.parse` with a
+    cryptic error, taking down the whole component (confirmed live in the
+    browser). **Fixed**: `pack_payload` now encodes the header with
+    `json.dumps(..., allow_nan=False)` and turns the resulting `ValueError`
+    into a clear, actionable Python-side error naming the likely cause and
+    the fix (pass an explicit `view_state=`, or drop null geometries).
+    Verified live: same repro now surfaces a clean Streamlit error box
+    instead of a `BidiComponent Error`; passing an explicit `view_state=`
+    lets the layer render normally. Regression tests in
+    `tests/test_serialize.py`.
+  - MultiPoint: renders correctly (`ScatterplotLayer`, `geoarrow.multipoint`
+    extension type) — verified in Python and live in the browser.
+- [x] Frontend errors: wrap per-layer build in try/catch so one bad layer
   degrades to a console error + skipped layer instead of taking down the whole
   component via the BidiComponent error boundary; include layer id and type in
-  every error message.
-- [ ] Multiple `st_lonboard` instances in one app (with and without keys) —
+  every error message. Implemented in `frontend/src/index.ts`'s per-layer loop
+  around `buildDeckLayers`; not cached, so a fingerprint-unchanged rerun
+  retries (and re-logs) rather than silently staying broken. Live-verified by
+  temporarily forcing one layer to throw (alongside a normal layer) and
+  confirming: the good layer still renders, the console error names the
+  layer's id and type, and there's no BidiComponent crash - then reverted the
+  test hook and rebuilt (bundle size matches pre-change exactly).
+- [x] Multiple `st_lonboard` instances in one app (with and without keys) —
   verify no identity collisions or cross-instance state bleed; add a smoke
-  test.
+  test. Live-verified three scenarios: (1) two maps with different data, no
+  key - both render independently, no bleed; (2) two maps with
+  byte-identical data, no key - Streamlit itself raises
+  `StreamlitDuplicateElementId` (same as any duplicate widget call; not a
+  streamlit-lonboard bug, but a real gotcha, so the `key` docstring in
+  `component.py` now calls it out explicitly); (3) two maps with distinct
+  explicit keys - both render independently. No cross-instance state bleed
+  found: frontend state lives per-`parentElement` (one per component
+  instance, see `index.ts`'s `MOUNT_KEY`), and the Python
+  `serialize_layer_cached` cache is keyed on `(layer object identity,
+  layer_id)`, which is exactly the granularity needed for correctness even
+  when the same layer object is reused across multiple `st_lonboard()` calls.
 - Exit criteria: every failure mode above produces a message that names the
   offending layer and says what to do about it; none of them crash the app.
 

@@ -206,7 +206,20 @@ export default async function mount(component: ComponentApi): Promise<() => void
       continue;
     }
 
-    const built = buildDeckLayers(layerHeader, parsedLayer.table, state.subLayerLookup);
+    let built: Layer[];
+    try {
+      built = buildDeckLayers(layerHeader, parsedLayer.table, state.subLayerLookup);
+    } catch (error) {
+      // One bad layer (e.g. a props/data mismatch) shouldn't take down every
+      // other layer on the map via the BidiComponent error boundary - log and
+      // skip it instead. Not cached: a fingerprint-unchanged rerun will retry
+      // the build (and re-log) rather than silently staying broken forever.
+      console.error(
+        `streamlit-lonboard: failed to build layer "${layerHeader.id}" (type: "${layerHeader.type}") - skipping it.`,
+        error,
+      );
+      continue;
+    }
     const subLayerEntries = Array.from(state.subLayerLookup.entries()).filter(
       ([, info]) => info.lonboardLayerId === layerHeader.id,
     );

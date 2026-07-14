@@ -15,7 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from lonboard import PathLayer, ScatterplotLayer
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, MultiPoint, Point
 
 
 def _load_module(pkg_dir: Path, name: str):
@@ -249,3 +249,67 @@ def test_pack_payload_roundtrip(points_gdf):
     with pa.ipc.open_stream(ipc_bytes) as reader:
         table = reader.read_all()
     assert table.num_rows == 3
+
+
+def test_check_payload_size_passes_under_limit():
+    serialize.check_payload_size(b"x" * 1000, max_mb=200)  # should not raise
+
+
+def test_check_payload_size_raises_actionable_error_over_limit():
+    payload = b"x" * 5_000_000  # 5MB
+
+    with pytest.raises(ValueError, match=r"5\.0MB.*exceeds.*server\.maxMessageSize.*4MB") as exc_info:
+        serialize.check_payload_size(payload, max_mb=4)
+
+    message = str(exc_info.value)
+    assert "Downsample" in message
+    assert "compression=" in message
+    assert "server.maxMessageSize" in message
+
+
+def test_serialize_layer_handles_null_geometry():
+    """A null geometry mixed with real points must not raise in serialize_layer
+    itself - the row is kept (with a null geometry entry), matching lonboard's
+    own behavior. The NaN this produces in lonboard's auto-computed view state
+    is a separate, later failure mode - see
+    test_pack_payload_rejects_non_finite_numbers."""
+    gdf = gpd.GeoDataFrame(geometry=[Point(0, 0), None, Point(1, 1)], crs="EPSG:4326")
+    layer = ScatterplotLayer.from_geopandas(gdf, get_fill_color=[255, 0, 0])
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.table.num_rows == 3
+
+
+def test_serialize_layer_handles_multipoint():
+    gdf = gpd.GeoDataFrame(
+        geometry=[MultiPoint([(0, 0), (1, 1)]), MultiPoint([(2, 2), (3, 3)])],
+        crs="EPSG:4326",
+    )
+    layer = ScatterplotLayer.from_geopandas(gdf, get_fill_color=[255, 0, 0])
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.table.num_rows == 2
+    assert serialized.table.schema.field("geometry").metadata[serialize._EXTENSION_NAME_KEY] == (
+        b"geoarrow.multipoint"
+    )
+
+
+def test_pack_payload_rejects_non_finite_numbers(points_gdf):
+    """Regression test: lonboard's auto-computed view state (and, in general,
+    any prop derived from data) can be NaN - e.g. when a layer's geometry
+    column has null entries, lonboard's centroid/bbox math propagates NaN
+    through the nulls rather than skipping them. `json.dumps` otherwise
+    happily emits a bare `NaN` token, which is invalid JSON and crashes the
+    frontend's `JSON.parse` with a cryptic, hard-to-debug error instead of a
+    clear Python-side one."""
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    with pytest.raises(ValueError, match="non-finite number"):
+        serialize.pack_payload(
+            [serialized],
+            view_state={"longitude": float("nan"), "latitude": 1.0, "zoom": 7},
+            map_options={},
+        )

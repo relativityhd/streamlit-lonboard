@@ -320,7 +320,24 @@ def pack_payload(
             "mapOptions": map_options,
             "compression": used_compression,
         }
-        header_json = json.dumps(header).encode("utf-8")
+        try:
+            header_json = json.dumps(header, allow_nan=False).encode("utf-8")
+        except ValueError as e:
+            # Python's json.dumps otherwise happily emits bare `NaN`/`Infinity`
+            # tokens, which are invalid JSON and crash the frontend's
+            # `JSON.parse` with a cryptic error, taking down the whole
+            # component. The usual cause: a layer's auto-computed view state
+            # (or a prop derived from data) is NaN because the layer's
+            # geometry column contains null/missing entries - lonboard's own
+            # centroid/bbox math propagates NaN through nulls rather than
+            # skipping them.
+            raise ValueError(
+                "st_lonboard: payload contains a non-finite number (NaN/Infinity), which "
+                "is not valid JSON. This usually happens when a layer's auto-computed view "
+                "state is derived from data with null/missing geometries. Fix: pass an "
+                "explicit `view_state=` to st_lonboard(), or drop null geometries from your "
+                "data before building the layer."
+            ) from e
 
         payload = struct.pack("<I", len(header_json)) + header_json + compressed_body
 
@@ -332,3 +349,26 @@ def pack_payload(
     )
 
     return payload
+
+
+def check_payload_size(payload: bytes, *, max_mb: float) -> None:
+    """Fail fast with an actionable message instead of letting Streamlit
+    silently substitute a generic "message too large" error for the whole
+    component once the payload hits the WebSocket layer (`server.maxMessageSize`,
+    default 200MB - see `streamlit.runtime.runtime_util.MessageSizeError`).
+
+    `max_mb` is passed in (rather than read here via `st.get_option`) so this
+    stays testable without a running Streamlit app.
+    """
+    max_bytes = int(max_mb * 1_000_000)
+    if len(payload) > max_bytes:
+        raise ValueError(
+            f"st_lonboard: serialized payload is {len(payload) / 1e6:.1f}MB, which exceeds "
+            f"Streamlit's server.maxMessageSize limit of {max_mb}MB. To fix this:\n"
+            "  - Downsample your data (fewer rows, coarser geometry) - usually the right fix "
+            "for an interactive app.\n"
+            "  - Try compression='gzip' (see benchmarks/RESULTS.md for when this actually "
+            "helps - it isn't always a win).\n"
+            "  - Raise the limit by setting `server.maxMessageSize` in .streamlit/config.toml "
+            "(increases memory/latency for every client, so prefer downsampling first)."
+        )
