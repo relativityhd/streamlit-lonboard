@@ -26,11 +26,27 @@ interface ComponentApi {
   setTriggerValue: (eventKey: string, value: unknown) => void;
 }
 
+/**
+ * What a `buildDeckLayers` call produced for one lonboard layer, kept around
+ * so an unchanged rerun (fingerprint match, see container.ts) can be
+ * answered without re-parsing or reconstructing anything - see Phase 4b in
+ * IMPLEMENTATION_PLAN.md. Note the common "nothing at all changed" case
+ * already costs ~0 without this (CCv2 skips calling `mount()` entirely then,
+ * confirmed in Phase 4.0) - this cache only matters when *some* layers
+ * changed and others didn't within a single `mount()` invocation.
+ */
+interface LayerCacheEntry {
+  fingerprint: string;
+  deckLayers: Layer[];
+  subLayerEntries: [string, SubLayerInfo][];
+}
+
 interface MountState {
   map: maplibregl.Map;
   overlay: MapboxOverlay;
   container: HTMLDivElement;
   subLayerLookup: Map<string, SubLayerInfo>;
+  layerCache: Map<string, LayerCacheEntry>;
   lastBasemapStyle?: string;
   hoverThrottle?: ReturnType<typeof setTimeout>;
   viewStateThrottle?: ReturnType<typeof setTimeout>;
@@ -93,6 +109,7 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
     overlay: null as unknown as MapboxOverlay,
     container,
     subLayerLookup: new Map<string, SubLayerInfo>(),
+    layerCache: new Map<string, LayerCacheEntry>(),
   };
 
   const overlay = new MapboxOverlay({
@@ -140,23 +157,58 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
   return state;
 }
 
-function ensureMount(component: ComponentApi, header: ContainerHeader): MountState {
-  const existing = component.parentElement[MOUNT_KEY] as MountState | undefined;
-  return existing ?? createMount(component, header);
-}
-
 export default function mount(component: ComponentApi): () => void {
   performance.mark("st-lonboard:mount:start");
 
   const bytes = toUint8Array(component.data);
-  const { header, layers } = parseContainer(bytes);
-  const state = ensureMount(component, header);
+
+  // Peek at any existing mount's layer cache *before* parsing, so
+  // parseContainer can skip tableFromIPC for layers whose bytes haven't
+  // changed since last time (see container.ts).
+  const existingState = component.parentElement[MOUNT_KEY] as MountState | undefined;
+  const previousFingerprints = new Map<string, string>();
+  if (existingState) {
+    for (const [layerId, entry] of existingState.layerCache) {
+      previousFingerprints.set(layerId, entry.fingerprint);
+    }
+  }
+
+  const { header, layers } = parseContainer(bytes, previousFingerprints);
+  const state = existingState ?? createMount(component, header);
 
   state.subLayerLookup.clear();
   const deckLayers: Layer[] = [];
-  for (const { header: layerHeader, table } of layers) {
-    deckLayers.push(...buildDeckLayers(layerHeader, table, state.subLayerLookup));
+  const newLayerCache = new Map<string, LayerCacheEntry>();
+
+  for (const parsedLayer of layers) {
+    const { header: layerHeader, fingerprint } = parsedLayer;
+
+    if (parsedLayer.status === "unchanged") {
+      const cached = state.layerCache.get(layerHeader.id);
+      if (!cached) {
+        // Can't happen: "unchanged" is only returned when previousFingerprints
+        // (built from state.layerCache just above) already had this id+fingerprint.
+        throw new Error(
+          `streamlit-lonboard: internal error - layer ${layerHeader.id} reported unchanged ` +
+            "but has no cached build to reuse",
+        );
+      }
+      for (const [subId, info] of cached.subLayerEntries) {
+        state.subLayerLookup.set(subId, info);
+      }
+      deckLayers.push(...cached.deckLayers);
+      newLayerCache.set(layerHeader.id, cached);
+      continue;
+    }
+
+    const built = buildDeckLayers(layerHeader, parsedLayer.table, state.subLayerLookup);
+    const subLayerEntries = Array.from(state.subLayerLookup.entries()).filter(
+      ([, info]) => info.lonboardLayerId === layerHeader.id,
+    );
+    deckLayers.push(...built);
+    newLayerCache.set(layerHeader.id, { fingerprint, deckLayers: built, subLayerEntries });
   }
+  state.layerCache = newLayerCache;
 
   performance.mark("st-lonboard:setProps:start");
   state.overlay.setProps({ layers: deckLayers });

@@ -7,6 +7,7 @@
  */
 
 import { tableFromIPC, type Table } from "apache-arrow";
+import { fnv1a } from "./fingerprint";
 
 // Bump in lockstep with streamlit_lonboard.serialize.PAYLOAD_FORMAT_VERSION.
 const SUPPORTED_PAYLOAD_FORMAT_VERSION = 1;
@@ -44,17 +45,43 @@ export interface ContainerHeader {
   mapOptions: MapOptions;
 }
 
-export interface ParsedLayer {
+/**
+ * A layer whose byte slice's fingerprint matches the last time this same
+ * `id` was parsed (per `previousFingerprints`) - `tableFromIPC` was skipped
+ * entirely; the caller should reuse whatever it built from the previous
+ * parse (see `index.ts`'s per-layer deck.gl layer cache).
+ */
+export interface UnchangedLayer {
+  status: "unchanged";
   header: LayerHeader;
+  fingerprint: string;
+}
+
+export interface ChangedLayer {
+  status: "changed";
+  header: LayerHeader;
+  fingerprint: string;
   table: Table;
 }
+
+export type ParsedLayer = UnchangedLayer | ChangedLayer;
 
 export interface ParsedContainer {
   header: ContainerHeader;
   layers: ParsedLayer[];
 }
 
-export function parseContainer(bytes: Uint8Array): ParsedContainer {
+/**
+ * `previousFingerprints` (layer id -> fingerprint from the last call) lets
+ * this skip `tableFromIPC` for byte-identical layers, not just deck.gl layer
+ * construction - `tableFromIPC` is the dominant per-rerun frontend cost at
+ * scale (see benchmarks/RESULTS.md), so skipping the parse matters far more
+ * than skipping layer construction alone.
+ */
+export function parseContainer(
+  bytes: Uint8Array,
+  previousFingerprints: ReadonlyMap<string, string> = new Map(),
+): ParsedContainer {
   performance.mark("st-lonboard:parseContainer:start");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const headerLen = view.getUint32(0, true);
@@ -70,11 +97,17 @@ export function parseContainer(bytes: Uint8Array): ParsedContainer {
   const body = bytes.subarray(4 + headerLen);
 
   const layers: ParsedLayer[] = header.layers.map((layerHeader) => {
-    performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:start`);
     const ipcBytes = body.subarray(
       layerHeader.byteOffset,
       layerHeader.byteOffset + layerHeader.byteLength,
     );
+    const fingerprint = fnv1a(ipcBytes);
+
+    if (previousFingerprints.get(layerHeader.id) === fingerprint) {
+      return { status: "unchanged", header: layerHeader, fingerprint };
+    }
+
+    performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:start`);
     const table = tableFromIPC(ipcBytes);
     performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:end`);
     performance.measure(
@@ -82,7 +115,7 @@ export function parseContainer(bytes: Uint8Array): ParsedContainer {
       `st-lonboard:tableFromIPC[${layerHeader.id}]:start`,
       `st-lonboard:tableFromIPC[${layerHeader.id}]:end`,
     );
-    return { header: layerHeader, table };
+    return { status: "changed", header: layerHeader, fingerprint, table };
   });
 
   performance.mark("st-lonboard:parseContainer:end");

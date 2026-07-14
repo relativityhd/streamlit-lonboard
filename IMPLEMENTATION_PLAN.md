@@ -219,18 +219,28 @@ else changing) is already free. What's left for 4b is the case where
 `mount()` *does* fire because *something* changed — e.g. one of several
 layers — and rebuilds every layer instead of just the changed one.
 
-- [ ] Per-layer granularity: the header already carries per-layer
-  `byteOffset`/`byteLength`, so fingerprint each layer's slice and rebuild only
-  changed layers (common case: one big static layer + one small dynamic one).
-  Reuse prior `Table`/deck.gl layer instances for unchanged slices so deck.gl's
-  prop diffing sees stable identities.
-- [ ] Keep `subLayerLookup` consistent when only a subset of layers rebuilds.
-- [ ] Guard the cache by `key`-stability: cache lives on the mount state, which
-  already resets on remount.
-- Exit criteria: in a multi-layer map where only one layer's data changes
-  between reruns, measured `buildDeckLayers` time for the *unchanged* layers
-  drops to ~0 ms (visible in the 4.0 perf spans) instead of rebuilding
-  everything.
+- [x] Per-layer granularity: `container.ts`'s `parseContainer` now takes a
+  `previousFingerprints` map and computes an FNV-1a fingerprint per layer's
+  raw byte slice *before* parsing, returning `{status: "unchanged"}` (no
+  `tableFromIPC` call at all) for a match instead of just skipping layer
+  construction — `tableFromIPC` is the dominant frontend cost at scale (4.0
+  baseline), so skipping the parse matters more than skipping layer
+  construction alone. `index.ts`'s `mount()` keeps a
+  `layerCache: Map<layerId, {fingerprint, deckLayers, subLayerEntries}>` on
+  the mount state and reuses the prior deck.gl `Layer` instances verbatim
+  (same object references, not just same id) for unchanged layers.
+- [x] `subLayerLookup` stays consistent: cached `subLayerEntries` are
+  re-inserted for reused layers on every `mount()` call, so picking/hover
+  resolve correctly for layers served entirely from cache.
+- [x] Cache lives on `MountState`, which already resets on remount (new `key`
+  or first mount) - no separate guard needed.
+- Exit criteria met - verified live with a 2-layer app (one `st.cache_resource`
+  static layer, one layer rebuilt fresh each rerun): a rerun that changes only
+  the dynamic layer's data produces perf spans for `tableFromIPC[layer-0]`
+  and `buildDeckLayers[layer-0]` only - zero entries for the unchanged
+  `layer-1`, confirming it was neither re-parsed nor rebuilt. Picking on the
+  reused layer still resolves to the correct lonboard layer id and row index
+  afterward.
 
 #### 4c — Benchmarks vs `st.pydeck_chart` (publish in README)
 
