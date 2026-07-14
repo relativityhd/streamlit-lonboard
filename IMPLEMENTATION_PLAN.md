@@ -189,24 +189,26 @@ baseline proving it matters.
 
 #### 4a — Python-side serialization cache
 
-- [ ] Cache `serialize_layer` output keyed on layer identity. Two-level design:
-  - L1: `WeakKeyDictionary[layer, SerializedLayer]` — hits when the user reuses
-    the layer object across reruns (i.e. built it under `st.cache_resource`).
-    Invalidation: lonboard layers are ipywidgets with observable traits; hook
-    trait-change notifications to evict, or include a cheap traits fingerprint
-    in the key.
-  - L2 (only if 4.0 shows L1 misses dominate in practice): content fingerprint
-    of the underlying arro3 table — `id(layer.table)` is a good proxy since
-    lonboard tables are effectively immutable after construction; fall back to
-    (schema, num_rows, chunk buffer addresses) if `id()` proves too weak.
-- [ ] The common Streamlit pattern rebuilds the GeoDataFrame *and* the layer
-  every rerun, which no cache on our side can fix — document the
-  `st.cache_resource`-wrapped-layer-factory pattern prominently in the README
-  (this is likely worth more than the cache itself) and add it to
-  `examples/app.py`.
-- [ ] Re-measure against 4.0 baseline; record hit/miss deltas.
-- Exit criteria: rerun with unchanged data spends ~0 ms in our serialize path
-  on an L1 hit; example app demonstrates the cached pattern.
+- [x] Cache `serialize_layer` output keyed on layer identity
+  (`serialize_layer_cached` in `serialize.py`): `WeakKeyDictionary[layer,
+  SerializedLayer]`, hits when the user reuses the layer object across
+  reruns (i.e. built it under `st.cache_resource`). A hit skips table-building
+  *and* the Arrow IPC write (moved into `serialize_layer` itself so caching
+  captures both). Invalidation: layers are traitlets `HasTraits` instances, so
+  a `layer.observe(..., names=traitlets.All)` hook attached on first cache
+  populate evicts the entry on any trait mutation; a `layer_id` mismatch
+  (e.g. the app reordered its layers list) is also treated as a miss. L2
+  (content-fingerprint) skipped — not needed, see measurement below.
+- [x] Documented the `st.cache_resource`-wrapped-layer-factory pattern in the
+  README ("Performance" section) and in `examples/app.py` (all three demo
+  layers now built via `@st.cache_resource` functions).
+- [x] Re-measured against 4.0 baseline: verified live (`ST_LONBOARD_PERF=1`)
+  that with the example app's layers cache-resource'd, a rerun logs
+  `serialize_layer_cached[layer-N]: hit` for all layers and
+  `serialize_layers` drops from ~1.9ms to ~0.2-0.3ms.
+- Exit criteria met: rerun with unchanged, cache-resource'd layers spends
+  ~0ms in `serialize_layer`/IPC-write on a hit; example app demonstrates the
+  pattern.
 
 #### 4b — Frontend cache: skip redundant parse and layer rebuild
 

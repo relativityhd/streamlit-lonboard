@@ -10,7 +10,7 @@ from lonboard import Map
 from lonboard.basemap import CartoStyle
 
 from ._perf import perf_enabled, span
-from .serialize import pack_payload, serialize_layer
+from .serialize import pack_payload, serialize_layer_cached
 
 # Fully-qualified name = "<project name from pyproject.toml>.<[tool.streamlit.component] entry>".
 _COMPONENT_NAME = "streamlit-lonboard.lonboard_map"
@@ -75,7 +75,9 @@ def st_lonboard(
             basemap_style = str(map.basemap.style)
 
         with span("serialize_layers"):
-            serialized = [serialize_layer(layer, f"layer-{i}") for i, layer in enumerate(map.layers)]
+            serialized = [
+                serialize_layer_cached(layer, f"layer-{i}") for i, layer in enumerate(map.layers)
+            ]
 
         payload = pack_payload(
             serialized,

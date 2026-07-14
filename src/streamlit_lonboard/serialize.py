@@ -23,9 +23,11 @@ import json
 import struct
 from dataclasses import dataclass
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import pyarrow as pa
 import pyarrow.ipc
+import traitlets
 
 from ._perf import log, span
 
@@ -97,12 +99,18 @@ def _geometry_column_names(schema: pa.Schema) -> list[str]:
 
 @dataclass
 class SerializedLayer:
-    """One lonboard layer, ready to be packed into the wire payload."""
+    """One lonboard layer, ready to be packed into the wire payload.
+
+    `ipc_bytes` is precomputed (not derived from `table` on demand) so that
+    caching a `SerializedLayer` (see `serialize_layer_cached`) also caches the
+    Arrow IPC write, not just the table-building step.
+    """
 
     layer_id: str
     layer_type: str
     props: dict[str, Any]
     table: pa.Table
+    ipc_bytes: bytes
 
 
 def build_layer_props(layer: Any) -> tuple[dict[str, Any], dict[str, pa.ChunkedArray]]:
@@ -153,8 +161,19 @@ def _canonicalize_table(table: pa.Table) -> pa.Table:
     return pa.Table.from_arrays(table.columns, schema=schema)
 
 
+def _table_to_ipc_bytes(table: pa.Table) -> bytes:
+    sink = io.BytesIO()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return sink.getvalue()
+
+
 def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
-    """Serialize a single lonboard layer into scalar props + a minimal Arrow table."""
+    """Serialize a single lonboard layer into scalar props + a minimal Arrow table.
+
+    Not cached - see `serialize_layer_cached` for the memoized entry point
+    `st_lonboard()` actually uses.
+    """
     with span(f"serialize_layer[{layer_id}]"):
         layer_type = SUPPORTED_LAYER_TYPES.get(layer._layer_type)
         if layer_type is None:
@@ -175,15 +194,52 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
         for name, chunked in accessor_columns.items():
             out_table = out_table.append_column(name, chunked)
         out_table = _canonicalize_table(out_table)
+        ipc_bytes = _table_to_ipc_bytes(out_table)
 
-        return SerializedLayer(layer_id=layer_id, layer_type=layer_type, props=props, table=out_table)
+        return SerializedLayer(
+            layer_id=layer_id,
+            layer_type=layer_type,
+            props=props,
+            table=out_table,
+            ipc_bytes=ipc_bytes,
+        )
 
 
-def _table_to_ipc_bytes(table: pa.Table) -> bytes:
-    sink = io.BytesIO()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
-    return sink.getvalue()
+# WeakKeyDictionary so cache entries disappear once the user's layer object
+# does (no manual cache size management needed). Keyed on the layer object
+# itself: two lonboard Layer instances are never "the same" just because
+# their content matches, so this only ever helps when the *same* object is
+# passed again - e.g. built once under `st.cache_resource` (see README /
+# examples/app.py). See IMPLEMENTATION_PLAN.md Phase 4a.
+_layer_cache: "WeakKeyDictionary[Any, SerializedLayer]" = WeakKeyDictionary()
+# Tracks which layer objects already have our invalidation observer attached,
+# so we don't re-attach it (and re-evict) on every cache hit.
+_observed_layers: "WeakKeyDictionary[Any, None]" = WeakKeyDictionary()
+
+
+def _evict_cache_on_trait_change(change: dict[str, Any]) -> None:
+    _layer_cache.pop(change["owner"], None)
+
+
+def serialize_layer_cached(layer: Any, layer_id: str) -> SerializedLayer:
+    """Like `serialize_layer`, but memoized on layer object identity.
+
+    A cache hit skips table-building *and* the Arrow IPC write entirely.
+    Invalidated automatically if any trait on the layer changes (lonboard
+    layers are traitlets `HasTraits` instances), or if the same object is
+    reused at a different `layer_id` (e.g. the app reordered its layers list).
+    """
+    cached = _layer_cache.get(layer)
+    if cached is not None and cached.layer_id == layer_id:
+        log("serialize_layer_cached[%s]: hit", layer_id)
+        return cached
+
+    serialized = serialize_layer(layer, layer_id)
+    _layer_cache[layer] = serialized
+    if layer not in _observed_layers:
+        layer.observe(_evict_cache_on_trait_change, names=traitlets.All)
+        _observed_layers[layer] = None
+    return serialized
 
 
 def pack_payload(
@@ -200,8 +256,7 @@ def pack_payload(
         body = io.BytesIO()
         layer_headers = []
         for layer in serialized_layers:
-            with span(f"pack_payload.write_ipc[{layer.layer_id}]"):
-                ipc_bytes = _table_to_ipc_bytes(layer.table)
+            ipc_bytes = layer.ipc_bytes
             layer_headers.append(
                 {
                     "id": layer.layer_id,

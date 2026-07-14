@@ -112,6 +112,48 @@ def test_serialize_layer_is_byte_deterministic():
     assert len({blob for blob in blobs}) == 1
 
 
+def test_serialize_layer_cached_hits_on_same_object(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+
+    first = serialize.serialize_layer_cached(layer, "layer-0")
+    second = serialize.serialize_layer_cached(layer, "layer-0")
+
+    assert first is second
+
+
+def test_serialize_layer_cached_misses_on_different_object(points_gdf):
+    layer_a = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    layer_b = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+
+    first = serialize.serialize_layer_cached(layer_a, "layer-0")
+    second = serialize.serialize_layer_cached(layer_b, "layer-0")
+
+    assert first is not second
+    assert first.ipc_bytes == second.ipc_bytes  # same content, just not cached across objects
+
+
+def test_serialize_layer_cached_misses_on_different_layer_id(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+
+    first = serialize.serialize_layer_cached(layer, "layer-0")
+    second = serialize.serialize_layer_cached(layer, "layer-1")
+
+    assert first is not second
+    assert second.layer_id == "layer-1"
+
+
+def test_serialize_layer_cached_invalidates_on_trait_change(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+
+    first = serialize.serialize_layer_cached(layer, "layer-0")
+    layer.get_fill_color = [0, 255, 0]
+    second = serialize.serialize_layer_cached(layer, "layer-0")
+
+    assert first is not second
+    assert first.props["getFillColor"] == [255, 0, 0]
+    assert second.props["getFillColor"] == [0, 255, 0]
+
+
 def test_pack_payload_roundtrip(points_gdf):
     layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
     serialized = serialize.serialize_layer(layer, "layer-0")

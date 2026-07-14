@@ -45,6 +45,36 @@ result = st_lonboard(layers=[layer], height=600, key="map")
 st.write("Clicked feature index:", result.clicked)
 ```
 
+## Performance
+
+Streamlit reruns your whole script on every interaction, so building this
+`ScatterplotLayer` from scratch happens again on every rerun unless you cache
+it. **Wrap layer construction in `@st.cache_resource`**:
+
+```python
+@st.cache_resource
+def build_layer():
+    gdf = gpd.read_parquet("internet-speeds.parquet")
+    return ScatterplotLayer.from_geopandas(gdf, get_fill_color=[255, 0, 0])
+
+layer = build_layer()
+result = st_lonboard(layers=[layer], height=600, key="map")
+```
+
+This matters more than it might look like: `st_lonboard()` memoizes its own
+Arrow serialization keyed on the layer *object*, so a cached layer skips
+re-serialization entirely on reruns that don't touch it (invalidated
+automatically if you mutate a layer's properties). Without
+`@st.cache_resource`, a fresh layer object is built every rerun and the cache
+never hits. See `examples/app.py` for a full example and
+[`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) Phase 4 for the full
+performance investigation, including a genuinely surprising find: Streamlit's
+component runtime already skips re-parsing and re-rendering on the frontend
+entirely when a rerun's output is byte-for-byte unchanged (see
+[`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) for measured numbers at
+10k/100k/1M points) — so the main thing left to optimize is Python-side
+re-serialization, which is exactly what the cache above avoids.
+
 ## Development
 
 Managed with [uv](https://docs.astral.sh/uv/). A [Hatchling build
