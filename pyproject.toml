@@ -32,6 +32,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "geopandas", "ruff"]
+# Only for benchmarks/ (Phase 4c contender comparison) - not needed to use
+# streamlit-lonboard itself. pydeck ships bundled with streamlit already;
+# listed explicitly here since benchmarks/contenders/pydeck_app.py imports it
+# directly. playwright drives the headless timing measurements.
+bench = ["pydeck", "playwright"]
 
 [project.urls]
 Repository = "https://github.com/relativityhd/streamlit-lonboard"

@@ -180,3 +180,165 @@ Two things worth calling out, one a correction to the plan's assumption:
   the feature (it's a real, sometimes-large win on slow networks) but treat
   the default threshold as provisional and document the tradeoff clearly
   rather than claim compression is a general improvement.
+
+## Phase 4c: benchmarks vs. `st.pydeck_chart` and `Map.to_html()`
+
+Environment: dev sandbox VM, Python 3.14.6, Streamlit 1.59.1, lonboard
+0.16.0, pydeck 0.9.3, pyarrow 24.0.0, Playwright 1.61.0 (Chromium, headless),
+24 vCPUs / 78GB RAM, localhost transport. Single-run wall-clock numbers, not
+averaged over multiple trials - order-of-magnitude comparisons, not precise
+benchmarks. Reproduce with `uv run python benchmarks/playwright_driver.py`
+(timing) and `uv run python benchmarks/payload_sizes.py` (wire size); both
+under `uv sync --extra bench` (adds `playwright`, `pydeck` - `uv run
+playwright install chromium` once).
+
+Three contenders, all rendering the same N-point `ScatterplotLayer` (same
+lon/lat, color, radius, seed - see `benchmarks/datagen.py`):
+`benchmarks/contenders/lonboard_app.py` (`st_lonboard`),
+`pydeck_app.py` (`st.pydeck_chart`), `tohtml_app.py` (lonboard's
+`Map.to_html()` embedded via `st.components.v1.html` - the workaround people
+use today without a custom component).
+
+### Wire payload size - the one comparison all three contenders support
+
+"Logical payload size" - the bytes of the actual data structure shipped to
+the frontend (Arrow IPC frame for `st_lonboard`, `pydeck.Deck.to_json()` for
+pydeck, the full HTML string for `to_html()`) - before any
+transport-level framing (WebSocket, HTTP). No compression on any side.
+
+| N points  | st_lonboard  | pydeck         | pydeck / lonboard | to_html      | to_html / lonboard |
+| --------: | -----------: | -------------: | -----------------: | -----------: | ------------------: |
+|    10,000 |     232,777 B|      1,921,536 B|               8.3x |    4,249,134 B|                18.3x |
+|   100,000 |   2,302,778 B|     19,210,266 B|               8.3x |    8,342,785 B|                 3.6x |
+| 1,000,000 |  23,003,691 B|    192,099,187 B|               8.3x |   47,589,834 B|                 2.1x |
+| 10,000,000| 230,012,332 B|  1,920,982,816 B|               8.3x |  430,318,722 B|                 1.9x |
+
+- **pydeck's JSON encoding is a consistent, flat ~8.3x larger than
+  `st_lonboard`'s binary Arrow IPC, at every scale.** This isn't a surprise -
+  JSON represents each float as ASCII digits (10-20 bytes) instead of 8 raw
+  bytes, plus per-row key repetition - but it's useful to have the exact,
+  stable multiplier measured rather than assumed. At 10M points this is the
+  difference between a 230MB and a 1.9GB payload.
+- **`to_html()`'s ratio shrinks from 18x to ~1.9x as N grows** - it has a
+  large *fixed* cost (~3.8MB: the inlined MapLibre GL JS + deck.gl JS runtime
+  bundle, present regardless of data size) that dominates at small N, but
+  converges toward roughly 2x lonboard's size at large N as the actual data
+  comes to dominate the fixed overhead. Its per-row encoding (Arrow IPC via
+  `arro3`, base64-wrapped for inline embedding) is close to `st_lonboard`'s,
+  just with ~33% base64 inflation plus the one-time JS runtime tax.
+
+### Render/rerun timing - measured for `st_lonboard` only
+
+Using Playwright to drive real Chromium: `time_to_first_render` (navigation
+to a fresh `streamlit run` process until the map canvas appears and its
+bounding box stops changing), `rerun_unchanged` (click "Rerun (unchanged
+data)" until the same settle condition), `interaction_rerun` (simulate a
+canvas drag, until settle again - only meaningful with
+`return_view_state=True`).
+
+| N points  | time_to_first_render | rerun (unchanged) | interaction rerun |
+| --------: | --------------------: | -----------------: | ------------------: |
+|    10,000 |                3,937ms|               815ms|             9,543ms |
+|   100,000 |                8,862ms|               945ms|            33,872ms |
+| 1,000,000 |               59,998ms|             1,443ms|           290,703ms |
+| 10,000,000|                    DNF (script/canvas not ready within 90s) |
+
+- **`time_to_first_render` includes full cold-start overhead** - launching a
+  fresh `streamlit run` process, downloading the ~2.5MB frontend JS bundle,
+  WASM/Arrow runtime init - not just render cost at that N. Treat the
+  `rerun (unchanged)` column as the better proxy for steady-state cost: it
+  excludes all of that and stays under 1.5s even at 1M points, consistent
+  with the Phase 4.0 finding that CCv2 skips `mount()` entirely for
+  byte-identical output (see above) - the residual cost here is Streamlit's
+  own per-rerun script execution + hashing, not ours to remove.
+- **`interaction_rerun` scales far worse than anything else measured in this
+  project - and it's very likely measuring more than one round trip.** A
+  simulated drag triggers MapLibre's pan/fly easing animation, which keeps
+  firing `onViewStateChange` for a couple of seconds after mouseup; each
+  event is throttled to at most one Streamlit rerun per 200ms
+  (`frontend/src/index.ts`), but *each of those reruns* still re-runs
+  `pack_payload()` from scratch in Python - which unconditionally re-copies
+  and re-frames the (per-layer-cached, but not payload-cached) IPC bytes
+  every single call, at full cost, regardless of whether the underlying
+  layer changed. That cost is what scales with N here, and a multi-second
+  easing animation multiplies it by however many throttled reruns fire
+  during that window. **This is a real, previously-undocumented optimization
+  opportunity** for a future phase: cache the fully-packed payload (not just
+  the per-layer serialization) keyed on `(layers, view_state)`, or skip
+  re-framing entirely when only `view_state` changed. Flagging it here
+  rather than fixing it - out of scope for a benchmarking phase, and Phase 4
+  is measurement-first by design.
+- **10M points DNF'd**: the page's `data-test-script-state` never reached
+  `"notRunning"` within the 90s startup budget. Plausibly genuine (a 230MB
+  payload plus the same `pack_payload` cost above), not investigated further
+  in this pass - if this matters for a real deployment, it's the first place
+  to look.
+- pydeck and `to_html()` have **no equivalent metric for `interaction_rerun`
+  at all** - neither ever sends a view-state change back to Python (pydeck's
+  `st.pydeck_chart` has no such callback; `to_html()`'s output has no
+  Python<->JS channel whatsoever). This is architectural, not a limitation of
+  this benchmark: panning either of those costs Streamlit **nothing**, in
+  exchange for never being able to react to it server-side.
+
+### pydeck: not reliably measurable under headless Chromium automation here
+
+`st.pydeck_chart` renders correctly under normal interactive use (confirmed
+manually via a real browser session earlier in this project). Under
+Playwright's headless Chromium automation in this environment, though, it
+hit a reproducible stall: `page.locator("canvas")` never finds a stable
+canvas within the 90s startup budget, and even a trivial `page.evaluate(()
+=> 1+1)` call can hang indefinitely a couple of seconds after the page
+loads. Console logs show `GL Driver Message ... GPU stall due to
+ReadPixels` warnings around the same time, consistent with deck.gl's WebGL
+picking readback stalling the renderer's main thread under this
+environment's (sandboxed, likely software-rendered) GPU path. This is
+reported as an **environment-specific limitation of automated headless
+measurement**, not a claim that pydeck itself is broken - and it's exactly
+why `playwright_driver.py`'s measurements run each `(contender, N)` in its
+own subprocess with a hard wall-clock timeout (see the module docstring):
+without that boundary, one stalled pydeck measurement would hang the entire
+benchmark run indefinitely. Not investigated further past confirming the
+stall is reproducible and bounded.
+
+### `Map.to_html()`: a hard, scale-independent DNF when embedded
+
+Unlike pydeck, this isn't an automation artifact - `Map.to_html()`'s output
+**never renders at all** when embedded via `st.components.v1.html`, at any
+scale, confirmed by direct inspection rather than timing:
+
+- The same `to_html()` output, served standalone (outside any iframe), earlier renders correctly (2
+  canvases, confirmed with Playwright).
+- Embedded via `components.v1.html`, only require.js and the
+  `@jupyter-widgets/html-manager` bootstrap script ever load; the actual
+  widget bundle, the anywidget runtime, and the WASM parquet reader never
+  fire a single network request, and no error is surfaced anywhere - the map
+  area just stays blank forever.
+- Root cause, confirmed directly: `document.baseURI` inside the sandboxed
+  `srcdoc` iframe Streamlit uses correctly resolves to the parent page's real
+  URL, but `document.location.href` is the opaque literal string
+  `"about:srcdoc"`. anywidget/require.js's dynamic module loader apparently
+  depends on `location.href` (not `baseURI`) to resolve the URLs of
+  subsequently-loaded modules, which breaks unconditionally inside *any*
+  `srcdoc`-based iframe embedding - not specific to Streamlit, but Streamlit
+  is exactly what `components.v1.html` uses.
+
+This means "just call `Map.to_html()` and embed it" - the workaround this
+project exists to replace - **doesn't work at all** for lonboard's current
+(anywidget-based) export format, for any dataset size. `playwright_driver.py`
+records this as a fixed DNF for every scale rather than attempting to time
+something that never renders.
+
+### Summary
+
+- **Payload size**: `st_lonboard`'s binary format is a measured, consistent
+  ~8.3x smaller than pydeck's JSON at every scale tested (10k-10M points).
+- **Render/rerun timing**: only fully measurable for `st_lonboard` in this
+  environment; steady-state reruns stay sub-1.5s through 1M points, but
+  interaction-triggered reruns (`return_view_state=True`) reveal a real,
+  scale-dependent cost worth optimizing in a future phase (see above).
+- **pydeck**: works interactively, but its headless-automation profile in
+  this specific sandboxed environment made timing unreliable - reported
+  honestly as an environment limitation rather than forced or extrapolated.
+- **`Map.to_html()` embedded via `components.v1.html`**: doesn't render at
+  all, at any scale - a hard architectural gap in the workaround this
+  project replaces, not a performance finding.

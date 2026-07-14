@@ -54,6 +54,33 @@
         "exec env PYTHONFAULTHANDLER=1 ST_LONBOARD_PERF=1 BENCH_N=1000000 BENCH_COMPRESSION=gzip BENCH_CLUSTERED=1 uv run streamlit run benchmarks/bench_app.py --server.headless true > /tmp/bench_1m_gzip_clustered.log 2>&1"
       ],
       "port": 8501
+    },
+    {
+      "name": "contender-lonboard",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 BENCH_N=10000 uv run streamlit run benchmarks/contenders/lonboard_app.py --server.headless true > /tmp/contender_lonboard.log 2>&1"
+      ],
+      "port": 8501
+    },
+    {
+      "name": "contender-pydeck",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 BENCH_N=10000 uv run streamlit run benchmarks/contenders/pydeck_app.py --server.headless true > /tmp/contender_pydeck.log 2>&1"
+      ],
+      "port": 8501
+    },
+    {
+      "name": "contender-tohtml",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 BENCH_N=10000 uv run streamlit run benchmarks/contenders/tohtml_app.py --server.headless true > /tmp/contender_tohtml.log 2>&1"
+      ],
+      "port": 8501
     }
   ]
 }

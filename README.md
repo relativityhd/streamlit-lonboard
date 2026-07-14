@@ -89,6 +89,27 @@ connections where the transfer savings outweigh that added CPU time. See
 [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) for the numbers behind
 this. Pass `compression=None` to disable it outright.
 
+### vs. `st.pydeck_chart` and `Map.to_html()`
+
+Measured across 10k-10M points (`benchmarks/playwright_driver.py`,
+`benchmarks/payload_sizes.py`; full numbers and methodology in
+[`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md)):
+
+- **Wire size**: `st_lonboard`'s Arrow IPC payload is a consistent ~8.3x
+  smaller than `st.pydeck_chart`'s JSON at every scale tested (230MB vs.
+  1.9GB at 10M points).
+- **`Map.to_html()` embedded via `st.components.v1.html`** — the workaround
+  people use today without a custom component — **doesn't render at all**,
+  at any scale. Root cause: inside Streamlit's sandboxed `srcdoc` iframe,
+  `document.location.href` is the opaque string `"about:srcdoc"`, which
+  breaks requirejs/anywidget's module-loading URL resolution; the actual
+  widget bundle never loads and no error is shown. The same HTML renders
+  fine served standalone (outside an iframe).
+- **`st.pydeck_chart` itself renders fine interactively**, but rendering
+  timing wasn't reliably measurable under headless browser automation in
+  our environment (an intermittent WebGL/GPU stall unrelated to pydeck's
+  correctness) — reported as an environment limitation rather than forced.
+
 ## Development
 
 Managed with [uv](https://docs.astral.sh/uv/). A [Hatchling build

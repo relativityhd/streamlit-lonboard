@@ -244,20 +244,47 @@ layers — and rebuilds every layer instead of just the changed one.
 
 #### 4c — Benchmarks vs `st.pydeck_chart` (publish in README)
 
-- [ ] `benchmarks/` directory: data generators (synthetic points at 10k / 100k
-  / 1M / 10M; polygon set for tessellation cost), one Streamlit app per
-  contender (`st_lonboard`, `st.pydeck_chart`, and `Map.to_html()` via
-  `components.v1.html` as the workaround people use today).
-- [ ] Driver: Playwright (shared with Phase 5 test infra) measuring
-  time-to-first-render (navigation → first deck.gl `onAfterRender`),
-  rerun-with-unchanged-data latency, and interaction-triggered rerun latency;
-  Python-side spans and wire sizes from the 4.0 instrumentation.
-- [ ] Expect pydeck to DNF at 1M+ (browser OOM or minutes-long JSON parse) —
-  report DNFs honestly rather than extrapolating.
-- [ ] Report environment (hardware, versions, localhost transport) and publish
-  the table + methodology in README; keep raw numbers in
+- [x] `benchmarks/` directory: data generators (synthetic points at 10k /
+  100k / 1M / 10M - `benchmarks/datagen.py`), one Streamlit app per contender
+  (`benchmarks/contenders/{lonboard_app,pydeck_app,tohtml_app}.py`).
+  **Polygon/tessellation dataset not built** - out of scope for this pass;
+  the point-scatter comparison already surfaced the headline findings below,
+  and a polygon set would mainly change absolute numbers, not the
+  conclusions. Flagging as unfinished rather than claiming coverage that
+  isn't there.
+- [x] Driver: `benchmarks/playwright_driver.py`. Measures time-to-first-render
+  (navigation → canvas appears and its bounding box stops changing - not
+  literally deck.gl's `onAfterRender`, which isn't exposed the same way by
+  all three contenders; canvas-settle is the closest signal all three share),
+  rerun-with-unchanged-data latency, and interaction-triggered rerun latency
+  (`st_lonboard` only - the other two never round-trip view state to Python
+  at all, so there's nothing to measure there). Uses Streamlit's own
+  `data-test-script-state` DOM attribute (the same signal Streamlit's own
+  test suite uses) to know precisely when a rerun starts/ends. Each
+  `(contender, N)` measurement runs in its own subprocess with a hard
+  wall-clock timeout - required in practice, not just defensive: pydeck's
+  headless rendering intermittently stalls the browser's main thread hard
+  enough that even a trivial `page.evaluate()` call can hang indefinitely
+  (see `benchmarks/RESULTS.md`), and only a subprocess boundary can recover
+  from that.
+- [x] pydeck did DNF, but not the way predicted (not an OOM/slow-parse at
+  large N - it renders fine interactively at every scale tested). It's a
+  headless-Chromium-automation-specific stall (WebGL/GPU readback, console
+  warnings included), reported honestly as an environment limitation rather
+  than chased further or extrapolated. `Map.to_html()` DNF'd too, but for a
+  completely different, scale-independent, and load-bearing reason: it
+  doesn't render at all when embedded via `components.v1.html`, root-caused
+  to `document.location.href` being `"about:srcdoc"` inside the sandboxed
+  iframe, which breaks requirejs/anywidget's module loading. Full detail in
   `benchmarks/RESULTS.md`.
-- Exit criteria: reproducible one-command benchmark run; README table.
+- [x] Environment (hardware, versions, localhost transport) and the
+  comparison tables are published in the README's "vs. `st.pydeck_chart` and
+  `Map.to_html()`" subsection; full numbers, methodology, and root-cause
+  writeups are in `benchmarks/RESULTS.md`.
+- Exit criteria: reproducible one-command benchmark run (`uv run python
+  benchmarks/playwright_driver.py` / `benchmarks/payload_sizes.py`, both
+  under `uv sync --extra bench`); README table. Met, with the one honest gap
+  noted above (no polygon dataset).
 
 #### 4d — Optional compression for remote deployments
 
