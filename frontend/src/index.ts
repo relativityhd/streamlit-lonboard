@@ -157,7 +157,7 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
   return state;
 }
 
-export default function mount(component: ComponentApi): () => void {
+export default async function mount(component: ComponentApi): Promise<() => void> {
   performance.mark("st-lonboard:mount:start");
 
   const bytes = toUint8Array(component.data);
@@ -173,7 +173,12 @@ export default function mount(component: ComponentApi): () => void {
     }
   }
 
-  const { header, layers } = parseContainer(bytes, previousFingerprints);
+  // parseContainer is async because a gzip-compressed payload
+  // (compression="auto"/"gzip" in st_lonboard()) needs to go through the
+  // browser's native (Promise-based) DecompressionStream before it can be
+  // sliced into per-layer Arrow IPC ranges. CCv2 awaits this default export,
+  // so an async mount() is supported (confirmed against the bundled runtime).
+  const { header, layers } = await parseContainer(bytes, previousFingerprints);
   const state = existingState ?? createMount(component, header);
 
   state.subLayerLookup.clear();

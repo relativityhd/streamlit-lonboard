@@ -10,7 +10,7 @@ from lonboard import Map
 from lonboard.basemap import CartoStyle
 
 from ._perf import perf_enabled, span
-from .serialize import pack_payload, serialize_layer_cached
+from .serialize import Compression, pack_payload, serialize_layer_cached
 
 # Fully-qualified name = "<project name from pyproject.toml>.<[tool.streamlit.component] entry>".
 _COMPONENT_NAME = "streamlit-lonboard.lonboard_map"
@@ -48,6 +48,7 @@ def st_lonboard(
     on_click: bool = True,
     on_hover: bool = False,
     return_view_state: bool = False,
+    compression: Compression = "auto",
     key: str | None = None,
 ) -> StLonboardResult:
     """Render lonboard layers in Streamlit using Arrow end to end (no GeoJSON).
@@ -61,6 +62,15 @@ def st_lonboard(
     reruns triggered by unrelated widgets elsewhere in the app — without one,
     the component's identity is derived from the serialized data and may
     remount when that data changes.
+
+    `compression` controls gzip compression of the Arrow payload:
+    - `"auto"` (default): compress only above
+      `serialize.AUTO_COMPRESSION_THRESHOLD` (1MB) of raw data. Worth it for
+      remote deployments; on localhost the extra CPU usually costs more than
+      it saves (see IMPLEMENTATION_PLAN.md §2 and Phase 4d), which is why the
+      threshold exists instead of always compressing.
+    - `"gzip"`: always compress, regardless of size.
+    - `None`: never compress.
     """
     with span("st_lonboard.total"):
         if map is not None and layers is not None:
@@ -90,6 +100,7 @@ def st_lonboard(
                 "returnViewState": return_view_state,
                 "perf": perf_enabled(),
             },
+            compression=compression,
         )
 
         callbacks: dict[str, Any] = {}

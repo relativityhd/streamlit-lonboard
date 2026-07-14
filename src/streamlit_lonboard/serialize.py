@@ -18,11 +18,12 @@ Design (see IMPLEMENTATION_PLAN.md §2):
 
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import struct
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from weakref import WeakKeyDictionary
 
 import pyarrow as pa
@@ -37,6 +38,17 @@ _EXTENSION_NAME_KEY = b"ARROW:extension:name"
 # backwards-compatible fields). frontend/src/container.ts rejects a mismatch
 # loudly instead of mis-parsing.
 PAYLOAD_FORMAT_VERSION = 1
+
+Compression = Literal["auto", "gzip"] | None
+
+# "auto" compresses only above this many raw body bytes. Below it, gzip's
+# fixed CPU cost (compress here, decompress + extra round trip in the
+# browser) isn't worth the transfer savings - and on localhost, IPC transfer
+# is fast enough that even large payloads often aren't worth compressing
+# (see IMPLEMENTATION_PLAN.md §2 and Phase 4d). Chosen so the 10k-point
+# baseline (~233KB, see benchmarks/RESULTS.md) stays uncompressed by default
+# while 100k+ (~2.3MB+) does not.
+AUTO_COMPRESSION_THRESHOLD = 1_000_000
 
 # lonboard `_layer_type` -> frontend GeoArrow*Layer tag (see frontend/src/layers.ts)
 SUPPORTED_LAYER_TYPES = {
@@ -242,15 +254,45 @@ def serialize_layer_cached(layer: Any, layer_id: str) -> SerializedLayer:
     return serialized
 
 
+def _compress_body(body: bytes, compression: Compression) -> tuple[bytes, str | None]:
+    """Returns `(possibly-compressed body, "gzip" or None)`.
+
+    `byteOffset`/`byteLength` in the layer headers are computed against the
+    *uncompressed* body before this runs, so the frontend must decompress the
+    whole body before slicing per-layer ranges out of it (see container.ts).
+    """
+    if compression is None:
+        return body, None
+    if compression == "auto":
+        if len(body) < AUTO_COMPRESSION_THRESHOLD:
+            return body, None
+        compression = "gzip"
+    if compression != "gzip":
+        raise ValueError(
+            f"st_lonboard: compression={compression!r} is not supported; use 'auto', 'gzip', or None"
+        )
+
+    with span("pack_payload.compress"):
+        compressed = gzip.compress(body, compresslevel=6)
+
+    if len(compressed) >= len(body):
+        # Already-compact/incompressible data (e.g. tiny or high-entropy
+        # payloads) - compressing would only add decode latency for nothing.
+        return body, None
+    return compressed, "gzip"
+
+
 def pack_payload(
     serialized_layers: list[SerializedLayer],
     *,
     view_state: dict[str, Any] | None,
     map_options: dict[str, Any],
+    compression: Compression = "auto",
 ) -> bytes:
     """Pack layers + view state + map options into a single framed `bytes` blob.
 
-    Layout: `<u32 header_len little-endian><utf-8 json header><concatenated ipc streams>`.
+    Layout: `<u32 header_len little-endian><utf-8 json header><concatenated ipc streams,
+    gzip-compressed as a whole if header["compression"] == "gzip">`.
     """
     with span("pack_payload"):
         body = io.BytesIO()
@@ -268,16 +310,25 @@ def pack_payload(
             )
             body.write(ipc_bytes)
 
+        raw_body = body.getvalue()
+        compressed_body, used_compression = _compress_body(raw_body, compression)
+
         header = {
             "v": PAYLOAD_FORMAT_VERSION,
             "layers": layer_headers,
             "viewState": view_state,
             "mapOptions": map_options,
+            "compression": used_compression,
         }
         header_json = json.dumps(header).encode("utf-8")
 
-        payload = struct.pack("<I", len(header_json)) + header_json + body.getvalue()
+        payload = struct.pack("<I", len(header_json)) + header_json + compressed_body
 
-    log("pack_payload: %d bytes total, %d layers", len(payload), len(serialized_layers))
+    log(
+        "pack_payload: %d bytes total (%s), %d layers",
+        len(payload),
+        used_compression or "uncompressed",
+        len(serialized_layers),
+    )
 
     return payload

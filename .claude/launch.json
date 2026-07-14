@@ -36,6 +36,24 @@
         "exec env PYTHONFAULTHANDLER=1 ST_LONBOARD_PERF=1 BENCH_N=1000000 uv run streamlit run benchmarks/bench_app.py --server.headless true > /tmp/bench_1m.log 2>&1"
       ],
       "port": 8501
+    },
+    {
+      "name": "bench-1m-gzip-uniform",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 ST_LONBOARD_PERF=1 BENCH_N=1000000 BENCH_COMPRESSION=gzip uv run streamlit run benchmarks/bench_app.py --server.headless true > /tmp/bench_1m_gzip_uniform.log 2>&1"
+      ],
+      "port": 8501
+    },
+    {
+      "name": "bench-1m-gzip-clustered",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 ST_LONBOARD_PERF=1 BENCH_N=1000000 BENCH_COMPRESSION=gzip BENCH_CLUSTERED=1 uv run streamlit run benchmarks/bench_app.py --server.headless true > /tmp/bench_1m_gzip_clustered.log 2>&1"
+      ],
+      "port": 8501
     }
   ]
 }

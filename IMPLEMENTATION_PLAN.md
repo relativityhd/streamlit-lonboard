@@ -261,26 +261,37 @@ layers — and rebuilds every layer instead of just the changed one.
 
 #### 4d — Optional compression for remote deployments
 
-- [ ] **Confirmed constraint:** arrow-js (v17, bundled) throws
+- [x] **Confirmed constraint:** arrow-js (v17, bundled) throws
   `"Record batch compression not implemented"` — Arrow IPC buffer compression
-  (zstd/lz4) is a dead end for the frontend. Realistic options:
-  1. Whole-payload gzip/deflate: `zlib` in Python, native `DecompressionStream`
-     in every modern browser — zero new dependencies on either side. Likely
-     winner on simplicity; ~100 MB/s compress, so only worth it off-localhost.
-  2. Parquet + `parquet-wasm` (lonboard's approach): better ratios on
-     coordinates, but adds a ~1 MB WASM module, async init, and a second
-     decode path. Only pursue if gzip ratios disappoint on real datasets.
-- [ ] Before any of this: add a format-version field to the payload header
-  (`"v": 1`) plus a `"compression"` field so old frontends fail loudly rather
-  than mis-parse. (Do this versioning change in 4.0 — it must land before any
-  format evolution.)
-- [ ] API: `st_lonboard(compression="auto" | "gzip" | None)`, default `"auto"`
-  = compress only above a size threshold; document that localhost users should
-  leave it off (IPC beats gzip+decode locally, per §2's original analysis).
-- [ ] Measure ratio + added latency on the benchmark datasets; publish
-  alongside 4c.
-- Exit criteria: measured decision documented (even if the decision is "gzip
-  only, Parquet not worth it" — or "none of it is worth it").
+  (zstd/lz4) is a dead end for the frontend. Went with whole-payload gzip:
+  `gzip.compress` in Python, native `DecompressionStream('gzip')` in the
+  browser — zero new dependencies on either side. Parquet/`parquet-wasm` not
+  pursued (see measurement below — gzip's ratio ceiling on this data isn't a
+  gzip-specific problem, so a different codec is unlikely to help much either
+  without a fundamentally different encoding like delta/quantization).
+- [x] Format-version field landed in 4.0 (`"v": 1`); added a `"compression":
+  "gzip" | null` header field alongside it in this phase.
+- [x] API: `st_lonboard(compression="auto" | "gzip" | None)`, default
+  `"auto"` = compress only above `serialize.AUTO_COMPRESSION_THRESHOLD` (1MB
+  raw). `pack_payload`'s `compression` param backs it; three dedicated
+  Python tests plus a live-browser check per mode (see below).
+- [x] Measured ratio + added latency on 1M-point uniform *and* clustered
+  datasets (`benchmarks/bench_app.py` now takes `BENCH_COMPRESSION`/
+  `BENCH_CLUSTERED`); full numbers and discussion in `benchmarks/RESULTS.md`.
+  Headline: ~11% size reduction (clustering doesn't meaningfully improve this
+  — gzip needs repeated byte sequences, not spatial proximity, and jittered
+  float64 coordinates stay high-entropy either way) for ~900ms-1s Python
+  compress + ~200ms JS decompress at 1M points. Verified live in the browser
+  for all three modes (`auto`-small stays uncompressed, `none` never
+  compresses, `gzip` always compresses even when tiny) — correct rendering
+  and picking, no console errors, in each case.
+- Exit criteria met, decision is **situational, not "always compress"**: keep
+  the feature since it's a real win on slow/high-latency networks, but the
+  CPU cost is large enough relative to the size win that it's a net loss on
+  localhost or fast links — document this plainly (done, in `RESULTS.md` and
+  the README) rather than claim compression is a general improvement. The
+  1MB `"auto"` threshold is a starting point to tune per-deployment, not a
+  validated-optimal default.
 
 #### 4e — Robustness & error surfaces
 

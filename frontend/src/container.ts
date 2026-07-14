@@ -43,6 +43,8 @@ export interface ContainerHeader {
   layers: LayerHeader[];
   viewState: MapViewState | null;
   mapOptions: MapOptions;
+  /** Set when `streamlit_lonboard.serialize.pack_payload`'s `compression=` gzipped the body. */
+  compression: "gzip" | null;
 }
 
 /**
@@ -71,6 +73,27 @@ export interface ParsedContainer {
   layers: ParsedLayer[];
 }
 
+/** Decompress a gzip-compressed body via the browser's native streaming decoder. */
+async function decompressGzip(bytes: Uint8Array): Promise<Uint8Array> {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error(
+      "streamlit-lonboard: this payload is gzip-compressed (compression='gzip'/'auto' in " +
+        "st_lonboard()), but this browser has no DecompressionStream support. Pass " +
+        "compression=None to st_lonboard() to disable compression, or use a modern browser.",
+    );
+  }
+  // TS types Uint8Array.buffer as ArrayBuffer | SharedArrayBuffer; ours is
+  // always a real ArrayBuffer in practice (bytes come from CCv2's `data`,
+  // never a SharedArrayBuffer), which is what Blob's constructor requires.
+  const arrayBuffer = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+  const stream = new Blob([arrayBuffer]).stream().pipeThrough(new DecompressionStream("gzip"));
+  const buffer = await new Response(stream).arrayBuffer();
+  return new Uint8Array(buffer);
+}
+
 /**
  * `previousFingerprints` (layer id -> fingerprint from the last call) lets
  * this skip `tableFromIPC` for byte-identical layers, not just deck.gl layer
@@ -78,10 +101,10 @@ export interface ParsedContainer {
  * scale (see benchmarks/RESULTS.md), so skipping the parse matters far more
  * than skipping layer construction alone.
  */
-export function parseContainer(
+export async function parseContainer(
   bytes: Uint8Array,
   previousFingerprints: ReadonlyMap<string, string> = new Map(),
-): ParsedContainer {
+): Promise<ParsedContainer> {
   performance.mark("st-lonboard:parseContainer:start");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const headerLen = view.getUint32(0, true);
@@ -94,7 +117,19 @@ export function parseContainer(
         "Python package and its frontend_dist build are out of sync - reinstall the package.",
     );
   }
-  const body = bytes.subarray(4 + headerLen);
+  const rawBody = bytes.subarray(4 + headerLen);
+
+  let body = rawBody;
+  if (header.compression === "gzip") {
+    performance.mark("st-lonboard:decompress:start");
+    body = await decompressGzip(rawBody);
+    performance.mark("st-lonboard:decompress:end");
+    performance.measure(
+      "st-lonboard:decompress",
+      "st-lonboard:decompress:start",
+      "st-lonboard:decompress:end",
+    );
+  }
 
   const layers: ParsedLayer[] = header.layers.map((layerHeader) => {
     const ipcBytes = body.subarray(

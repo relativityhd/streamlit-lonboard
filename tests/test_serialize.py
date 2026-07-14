@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import json
 import struct
@@ -152,6 +153,75 @@ def test_serialize_layer_cached_invalidates_on_trait_change(points_gdf):
     assert first is not second
     assert first.props["getFillColor"] == [255, 0, 0]
     assert second.props["getFillColor"] == [0, 255, 0]
+
+
+def _large_points_gdf(n: int = 100_000) -> gpd.GeoDataFrame:
+    """~1.6MB serialized (bare geometry, no accessors) - big enough to cross
+    AUTO_COMPRESSION_THRESHOLD (1MB)."""
+    rng = np.random.default_rng(0)
+    lon = rng.uniform(-122.6, -122.3, n)
+    lat = rng.uniform(37.6, 37.9, n)
+    return gpd.GeoDataFrame(geometry=[Point(x, y) for x, y in zip(lon, lat)], crs="EPSG:4326")
+
+
+def _unpack(blob: bytes) -> tuple[dict, bytes]:
+    header_len = struct.unpack("<I", blob[:4])[0]
+    header = json.loads(blob[4 : 4 + header_len])
+    return header, blob[4 + header_len :]
+
+
+def test_pack_payload_compression_none_never_compresses(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(_large_points_gdf(), get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression=None)
+
+    header, body = _unpack(blob)
+    assert header["compression"] is None
+    assert len(body) == len(serialized.ipc_bytes)
+
+
+def test_pack_payload_compression_gzip_always_compresses_even_when_tiny(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="gzip")
+
+    header, body = _unpack(blob)
+    assert header["compression"] == "gzip"
+    assert gzip.decompress(body) == serialized.ipc_bytes
+
+
+def test_pack_payload_compression_auto_skips_small_payloads(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="auto")
+
+    header, body = _unpack(blob)
+    assert header["compression"] is None
+    assert body == serialized.ipc_bytes
+
+
+def test_pack_payload_compression_auto_compresses_large_payloads():
+    layer = ScatterplotLayer.from_geopandas(_large_points_gdf(), get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0")
+    assert len(serialized.ipc_bytes) >= serialize.AUTO_COMPRESSION_THRESHOLD
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="auto")
+
+    header, body = _unpack(blob)
+    assert header["compression"] == "gzip"
+    assert len(body) < len(serialized.ipc_bytes)
+    assert gzip.decompress(body) == serialized.ipc_bytes
+
+
+def test_pack_payload_compression_rejects_unknown_value(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    with pytest.raises(ValueError, match="compression"):
+        serialize.pack_payload([serialized], view_state=None, map_options={}, compression="brotli")
 
 
 def test_pack_payload_roundtrip(points_gdf):

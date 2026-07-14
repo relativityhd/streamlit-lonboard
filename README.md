@@ -75,6 +75,20 @@ entirely when a rerun's output is byte-for-byte unchanged (see
 10k/100k/1M points) — so the main thing left to optimize is Python-side
 re-serialization, which is exactly what the cache above avoids.
 
+### Compression
+
+`st_lonboard(..., compression="auto" | "gzip" | None)` (default `"auto"`)
+gzips the Arrow payload above a 1MB threshold. **Measure before relying on
+this** — at 1M points it only shaved off ~11% (clustered *and* uniform-random
+data compressed about the same; gzip finds repeated byte sequences, not
+spatial/numeric proximity, so real GPS-precision coordinates don't compress
+much better than random ones) while costing ~900ms-1s of Python-side CPU plus
+~200ms of browser-side decompression per rerun — a net loss on localhost or
+any reasonably fast link, and only a likely win on slow/high-latency
+connections where the transfer savings outweigh that added CPU time. See
+[`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) for the numbers behind
+this. Pass `compression=None` to disable it outright.
+
 ## Development
 
 Managed with [uv](https://docs.astral.sh/uv/). A [Hatchling build

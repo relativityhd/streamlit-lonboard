@@ -47,11 +47,11 @@ actually running the script and re-hashing the result.
 All times in ms, single run. "wire bytes" = the framed payload
 (`serialize.pack_payload` output) actually sent.
 
-| N points | wire bytes | serialize_layers (py) | pack_payload (py, incl. IPC write) | mount (py, Streamlit hash+enqueue) | st_lonboard.total (py) | parseContainer (js) | buildDeckLayers (js) | setProps (js) | mount total (js) |
-| -------: | ---------: | ---------------------: | ----------------------------------: | -----------------------------------: | ----------------------: | -------------------: | ---------------------: | -------------: | -----------------: |
-|   10,000 |    233,033 |                  ~0.5  |                              ~0.4   |                                ~3.5   |                   ~7    |                 ~1.0  |                  ~0.1   |          ~0.3  |             ~1.4    |
-|  100,000 |  2,303,033 |                  ~0.6  |                              ~2.5   |                               ~17     |                  ~23    |                 ~1.7  |                  ~0.2   |          ~0.2  |             ~2.2    |
-| 1,000,000 | 23,003,658 |                  ~0.5  |                              ~25     |                              ~100-280 |               ~130-320  |                 ~15    |                  ~0.2   |          ~0.3  |             ~15.5   |
+|  N points | wire bytes | serialize_layers (py) | pack_payload (py, incl. IPC write) | mount (py, Streamlit hash+enqueue) | st_lonboard.total (py) | parseContainer (js) | buildDeckLayers (js) | setProps (js) | mount total (js) |
+| --------: | ---------: | --------------------: | ---------------------------------: | ---------------------------------: | ---------------------: | ------------------: | -------------------: | ------------: | ---------------: |
+|    10,000 |    233,033 |                  ~0.5 |                               ~0.4 |                               ~3.5 |                     ~7 |                ~1.0 |                 ~0.1 |          ~0.3 |             ~1.4 |
+|   100,000 |  2,303,033 |                  ~0.6 |                               ~2.5 |                                ~17 |                    ~23 |                ~1.7 |                 ~0.2 |          ~0.2 |             ~2.2 |
+| 1,000,000 | 23,003,658 |                  ~0.5 |                                ~25 |                           ~100-280 |               ~130-320 |                 ~15 |                 ~0.2 |          ~0.3 |            ~15.5 |
 
 ### Reading this table
 
@@ -125,3 +125,58 @@ process invocations. Regression test:
   JSON-based path doesn't pay in the same way (different bottleneck
   entirely - JSON encode/decode - but worth comparing where each approach's
   wall drops).
+
+## Phase 4d: gzip compression - measured, and it's a real tradeoff, not a clear win
+
+`st_lonboard(..., compression="auto" | "gzip" | None)`; "auto" (default)
+gzips the concatenated Arrow IPC body as a single blob only above
+`serialize.AUTO_COMPRESSION_THRESHOLD` (1MB raw). Measured with
+`BENCH_COMPRESSION=gzip BENCH_N=1000000 uv run streamlit run benchmarks/bench_app.py`
+(add `BENCH_CLUSTERED=1` for the second row):
+
+| data           | uncompressed | gzip'd     | ratio | compress (py) | decompress (js) |
+| -------------- | -----------: | ---------: | ----: | -------------: | ---------------: |
+| uniform-random |   23,003,658 | 20,561,626 |  ~89% |       ~900-1030ms |            ~211ms |
+| clustered (20 clusters + Gaussian jitter) | ~23,003,658 | 20,477,387 | ~89% | ~800-950ms | ~193ms |
+
+Two things worth calling out, one a correction to the plan's assumption:
+
+- **Clustering barely changes the ratio.** The hypothesis going in was that
+  real (spatially clustered) geographic data would compress much better than
+  uniform-random synthetic data. It doesn't, at least not for raw coordinate
+  bytes: gzip (LZ77 + Huffman) finds compressible structure in *repeated byte
+  sequences*, not numeric/spatial proximity. Per-point float64 coordinates -
+  even tightly clustered ones - still have high-entropy mantissa bits once
+  you add any continuous jitter, so the byte stream doesn't actually repeat
+  much. Real gains on coordinate data would need a different approach
+  entirely (delta/quantized encoding, spatial sorting) - general-purpose
+  gzip on IEEE-754 float64 arrays has a low ceiling regardless of the data's
+  real-world semantics. (uint8 color/other low-cardinality accessor columns
+  likely compress better than coordinates do, since gzip *can* exploit
+  repeated byte values there - not separately measured here.)
+- **The CPU cost is large relative to the size win.** ~11% smaller for
+  ~900ms-1s of Python-side compression plus ~200ms of JS-side decompression -
+  over a full second of added latency, every rerun the data actually
+  changes, to save ~2.4MB. Whether that's worth it depends entirely on the
+  deployment: on a slow/high-latency connection, 2.4MB less to transfer can
+  easily outweigh 1.2s of CPU (e.g. under 5 Mbps, 2.4MB alone takes ~4s to
+  transfer). On localhost or a fast link - probably the common case for
+  Streamlit apps - the CPU cost dominates and compression is a net loss, as
+  §2 originally predicted. **This is not a settled "always compress large
+  payloads" result** - it's why `compression` is a user-facing parameter
+  instead of always-on, and why `"auto"`'s threshold is a starting point to
+  tune, not a validated-optimal default. Users on constrained networks with
+  large (1M+ point) datasets should explicitly measure both ways rather than
+  trust the default.
+- Small payloads correctly skip compression under `"auto"` (verified at 5,000
+  points / ~98KB, well under the 1MB threshold - stays uncompressed) and
+  `compression=None` correctly never compresses regardless of size (verified
+  at 200,000 points / ~3.8MB). `compression="gzip"` correctly forces
+  compression even for tiny payloads (verified at 3 points). All three modes
+  verified end-to-end in a live browser: correct rendering, correct picking,
+  no console errors.
+- Exit criteria from the plan ("measured decision documented, even if the
+  decision is 'not worth it'"): met. The decision is **situational** - keep
+  the feature (it's a real, sometimes-large win on slow networks) but treat
+  the default threshold as provisional and document the tradeoff clearly
+  rather than claim compression is a general improvement.
