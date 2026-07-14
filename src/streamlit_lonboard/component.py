@@ -9,6 +9,7 @@ import streamlit.components.v2 as components
 from lonboard import Map
 from lonboard.basemap import CartoStyle
 
+from ._perf import perf_enabled, span
 from .serialize import pack_payload, serialize_layer
 
 # Fully-qualified name = "<project name from pyproject.toml>.<[tool.streamlit.component] entry>".
@@ -61,40 +62,47 @@ def st_lonboard(
     the component's identity is derived from the serialized data and may
     remount when that data changes.
     """
-    if map is not None and layers is not None:
-        raise ValueError("st_lonboard: pass either `map` or `layers`, not both")
+    with span("st_lonboard.total"):
+        if map is not None and layers is not None:
+            raise ValueError("st_lonboard: pass either `map` or `layers`, not both")
 
-    if map is None:
-        map = Map(layers=list(layers or []))
+        if map is None:
+            map = Map(layers=list(layers or []))
 
-    if view_state is None:
-        view_state = _view_state_to_dict(map.view_state)
-    if basemap_style == CartoStyle.PositronNoLabels and map.basemap is not None:
-        basemap_style = str(map.basemap.style)
+        if view_state is None:
+            view_state = _view_state_to_dict(map.view_state)
+        if basemap_style == CartoStyle.PositronNoLabels and map.basemap is not None:
+            basemap_style = str(map.basemap.style)
 
-    serialized = [serialize_layer(layer, f"layer-{i}") for i, layer in enumerate(map.layers)]
+        with span("serialize_layers"):
+            serialized = [serialize_layer(layer, f"layer-{i}") for i, layer in enumerate(map.layers)]
 
-    payload = pack_payload(
-        serialized,
-        view_state=view_state,
-        map_options={
-            "basemapStyle": str(basemap_style),
-            "height": height,
-            "onClick": on_click,
-            "onHover": on_hover,
-            "returnViewState": return_view_state,
-        },
-    )
+        payload = pack_payload(
+            serialized,
+            view_state=view_state,
+            map_options={
+                "basemapStyle": str(basemap_style),
+                "height": height,
+                "onClick": on_click,
+                "onHover": on_hover,
+                "returnViewState": return_view_state,
+                "perf": perf_enabled(),
+            },
+        )
 
-    callbacks: dict[str, Any] = {}
-    if on_click:
-        callbacks["on_clicked_change"] = lambda: None
-    if on_hover:
-        callbacks["on_hovered_change"] = lambda: None
-    if return_view_state:
-        callbacks["on_view_state_change"] = lambda: None
+        callbacks: dict[str, Any] = {}
+        if on_click:
+            callbacks["on_clicked_change"] = lambda: None
+        if on_hover:
+            callbacks["on_hovered_change"] = lambda: None
+        if return_view_state:
+            callbacks["on_view_state_change"] = lambda: None
 
-    result = _mount(data=payload, key=key, height=height, **callbacks)
+        # Includes Streamlit's own per-message identity hashing + ForwardMsgCache
+        # lookup - separate from "st_lonboard.total" so we know what's ours to
+        # optimize vs. Streamlit-internal cost (see IMPLEMENTATION_PLAN.md 4.0).
+        with span("mount (includes Streamlit identity hash + enqueue)"):
+            result = _mount(data=payload, key=key, height=height, **callbacks)
 
     return StLonboardResult(
         clicked=result.get("clicked"),

@@ -68,6 +68,9 @@ export function buildDeckLayers(
   table: Table,
   subLayerLookup: Map<string, SubLayerInfo>,
 ): Layer[] {
+  const markPrefix = `st-lonboard:buildDeckLayers[${layerHeader.id}]`;
+  performance.mark(`${markPrefix}:start`);
+
   const LayerClass = LAYER_CLASSES[layerHeader.type];
   if (!LayerClass) {
     console.warn(
@@ -91,5 +94,8 @@ export function buildDeckLayers(
     subLayerLookup.set(subLayerId, { lonboardLayerId: layerHeader.id, rowOffset });
     rowOffset += batch.numRows;
   });
+
+  performance.mark(`${markPrefix}:end`);
+  performance.measure(markPrefix, `${markPrefix}:start`, `${markPrefix}:end`);
   return layers;
 }

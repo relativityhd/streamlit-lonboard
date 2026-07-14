@@ -8,6 +8,9 @@
 
 import { tableFromIPC, type Table } from "apache-arrow";
 
+// Bump in lockstep with streamlit_lonboard.serialize.PAYLOAD_FORMAT_VERSION.
+const SUPPORTED_PAYLOAD_FORMAT_VERSION = 1;
+
 export interface LayerHeader {
   id: string;
   type: string;
@@ -30,9 +33,12 @@ export interface MapOptions {
   onClick?: boolean;
   onHover?: boolean;
   returnViewState?: boolean;
+  /** Mirrors ST_LONBOARD_PERF=1 on the Python side; logs a perf summary to the console. */
+  perf?: boolean;
 }
 
 export interface ContainerHeader {
+  v: number;
   layers: LayerHeader[];
   viewState: MapViewState | null;
   mapOptions: MapOptions;
@@ -49,20 +55,42 @@ export interface ParsedContainer {
 }
 
 export function parseContainer(bytes: Uint8Array): ParsedContainer {
+  performance.mark("st-lonboard:parseContainer:start");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const headerLen = view.getUint32(0, true);
   const headerJson = new TextDecoder().decode(bytes.subarray(4, 4 + headerLen));
   const header: ContainerHeader = JSON.parse(headerJson);
+  if (header.v !== SUPPORTED_PAYLOAD_FORMAT_VERSION) {
+    throw new Error(
+      `streamlit-lonboard: payload format v${header.v} is not supported by this frontend ` +
+        `build (expects v${SUPPORTED_PAYLOAD_FORMAT_VERSION}). The installed streamlit_lonboard ` +
+        "Python package and its frontend_dist build are out of sync - reinstall the package.",
+    );
+  }
   const body = bytes.subarray(4 + headerLen);
 
   const layers: ParsedLayer[] = header.layers.map((layerHeader) => {
+    performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:start`);
     const ipcBytes = body.subarray(
       layerHeader.byteOffset,
       layerHeader.byteOffset + layerHeader.byteLength,
     );
     const table = tableFromIPC(ipcBytes);
+    performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:end`);
+    performance.measure(
+      `st-lonboard:tableFromIPC[${layerHeader.id}]`,
+      `st-lonboard:tableFromIPC[${layerHeader.id}]:start`,
+      `st-lonboard:tableFromIPC[${layerHeader.id}]:end`,
+    );
     return { header: layerHeader, table };
   });
+
+  performance.mark("st-lonboard:parseContainer:end");
+  performance.measure(
+    "st-lonboard:parseContainer",
+    "st-lonboard:parseContainer:start",
+    "st-lonboard:parseContainer:end",
+  );
 
   return { header, layers };
 }

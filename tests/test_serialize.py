@@ -6,6 +6,7 @@ import importlib.util
 import json
 import struct
 import sys
+import types
 from pathlib import Path
 
 import geopandas as gpd
@@ -16,14 +17,27 @@ from lonboard import PathLayer, ScatterplotLayer
 from shapely.geometry import LineString, Point
 
 
-def _load_serialize_module():
-    path = Path(__file__).resolve().parents[1] / "src" / "streamlit_lonboard" / "serialize.py"
-    spec = importlib.util.spec_from_file_location("streamlit_lonboard.serialize", path)
+def _load_module(pkg_dir: Path, name: str):
+    spec = importlib.util.spec_from_file_location(f"streamlit_lonboard.{name}", pkg_dir / f"{name}.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules["streamlit_lonboard.serialize"] = module
+    sys.modules[f"streamlit_lonboard.{name}"] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_serialize_module():
+    """Load serialize.py (and its `._perf` dependency) without triggering
+    streamlit_lonboard/__init__.py -> component.py, which registers a CCv2
+    component and requires the full Streamlit runtime.
+    """
+    pkg_dir = Path(__file__).resolve().parents[1] / "src" / "streamlit_lonboard"
+    if "streamlit_lonboard" not in sys.modules:
+        pkg = types.ModuleType("streamlit_lonboard")
+        pkg.__path__ = [str(pkg_dir)]
+        sys.modules["streamlit_lonboard"] = pkg
+    _load_module(pkg_dir, "_perf")
+    return _load_module(pkg_dir, "serialize")
 
 
 serialize = _load_serialize_module()
@@ -73,6 +87,31 @@ def test_serialize_layer_rejects_unsupported_type(points_gdf):
         serialize.serialize_layer(layer, "layer-0")
 
 
+def test_serialize_layer_is_byte_deterministic():
+    """Regression test: arro3 builds extension metadata from a Rust HashMap,
+    whose key iteration order is randomized per construction - so the *same*
+    GeoDataFrame serialized twice independently used to produce different
+    Arrow IPC bytes (different FlatBuffers layout) despite identical content.
+    That breaks every content-hash cache downstream, including Streamlit's
+    own ForwardMsgCache. `_canonicalize_table` sorts field metadata keys to
+    fix this; this test constructs everything from scratch each iteration
+    (rather than reusing one layer object) to catch it.
+    """
+
+    def build_and_pack() -> bytes:
+        gdf = gpd.GeoDataFrame(geometry=[Point(0, 0), Point(1, 1), Point(2, 2)], crs="EPSG:4326")
+        layer = ScatterplotLayer.from_geopandas(gdf, get_fill_color=[255, 0, 0])
+        serialized = serialize.serialize_layer(layer, "layer-0")
+        return serialize.pack_payload(
+            [serialized],
+            view_state={"longitude": 1.0, "latitude": 1.0, "zoom": 7},
+            map_options={"height": 500},
+        )
+
+    blobs = [build_and_pack() for _ in range(20)]
+    assert len({blob for blob in blobs}) == 1
+
+
 def test_pack_payload_roundtrip(points_gdf):
     layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
     serialized = serialize.serialize_layer(layer, "layer-0")
@@ -85,6 +124,7 @@ def test_pack_payload_roundtrip(points_gdf):
 
     header_len = struct.unpack("<I", blob[:4])[0]
     header = json.loads(blob[4 : 4 + header_len])
+    assert header["v"] == serialize.PAYLOAD_FORMAT_VERSION
     assert header["viewState"] == {"longitude": 1.0, "latitude": 1.0, "zoom": 7}
     assert header["mapOptions"]["height"] == 500
 

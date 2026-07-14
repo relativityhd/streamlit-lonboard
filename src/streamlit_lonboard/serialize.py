@@ -27,7 +27,14 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.ipc
 
+from ._perf import log, span
+
 _EXTENSION_NAME_KEY = b"ARROW:extension:name"
+
+# Bump when the header/body framing changes shape (not for additive,
+# backwards-compatible fields). frontend/src/container.ts rejects a mismatch
+# loudly instead of mis-parsing.
+PAYLOAD_FORMAT_VERSION = 1
 
 # lonboard `_layer_type` -> frontend GeoArrow*Layer tag (see frontend/src/layers.ts)
 SUPPORTED_LAYER_TYPES = {
@@ -123,28 +130,53 @@ def build_layer_props(layer: Any) -> tuple[dict[str, Any], dict[str, pa.ChunkedA
     return props, accessor_columns
 
 
+def _canonicalize_table(table: pa.Table) -> pa.Table:
+    """Force deterministic IPC bytes for identical content.
+
+    arro3 builds field extension metadata (GeoArrow CRS JSON etc.) from a Rust
+    HashMap, whose iteration order is randomized per construction - so the
+    *same* GeoDataFrame serialized twice can get `{name, metadata}` vs.
+    `{metadata, name}` key order, which changes the Arrow IPC FlatBuffers byte
+    layout even though the content is identical. That breaks every
+    content-hash cache downstream (ours and Streamlit's own ForwardMsgCache),
+    so we sort each field's metadata keys here. Also drops schema-level
+    metadata (e.g. the "pandas" blob from geopandas) - we never read it and
+    it's pure payload bloat.
+    """
+    fields = []
+    for field in table.schema:
+        if field.metadata:
+            sorted_metadata = dict(sorted(field.metadata.items()))
+            field = field.with_metadata(sorted_metadata)
+        fields.append(field)
+    schema = pa.schema(fields)
+    return pa.Table.from_arrays(table.columns, schema=schema)
+
+
 def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
     """Serialize a single lonboard layer into scalar props + a minimal Arrow table."""
-    layer_type = SUPPORTED_LAYER_TYPES.get(layer._layer_type)
-    if layer_type is None:
-        raise ValueError(
-            f"streamlit-lonboard does not yet support layer type "
-            f"{layer._layer_type!r} (layer {layer_id}). Supported types: "
-            f"{sorted(SUPPORTED_LAYER_TYPES)}"
-        )
+    with span(f"serialize_layer[{layer_id}]"):
+        layer_type = SUPPORTED_LAYER_TYPES.get(layer._layer_type)
+        if layer_type is None:
+            raise ValueError(
+                f"streamlit-lonboard does not yet support layer type "
+                f"{layer._layer_type!r} (layer {layer_id}). Supported types: "
+                f"{sorted(SUPPORTED_LAYER_TYPES)}"
+            )
 
-    table = pa.table(layer.table)
-    props, accessor_columns = build_layer_props(layer)
+        table = pa.table(layer.table)
+        props, accessor_columns = build_layer_props(layer)
 
-    keep_columns = _geometry_column_names(table.schema)
-    if not keep_columns:
-        raise ValueError(f"layer {layer_id} has no GeoArrow-encoded geometry column")
+        keep_columns = _geometry_column_names(table.schema)
+        if not keep_columns:
+            raise ValueError(f"layer {layer_id} has no GeoArrow-encoded geometry column")
 
-    out_table = table.select(keep_columns)
-    for name, chunked in accessor_columns.items():
-        out_table = out_table.append_column(name, chunked)
+        out_table = table.select(keep_columns)
+        for name, chunked in accessor_columns.items():
+            out_table = out_table.append_column(name, chunked)
+        out_table = _canonicalize_table(out_table)
 
-    return SerializedLayer(layer_id=layer_id, layer_type=layer_type, props=props, table=out_table)
+        return SerializedLayer(layer_id=layer_id, layer_type=layer_type, props=props, table=out_table)
 
 
 def _table_to_ipc_bytes(table: pa.Table) -> bytes:
@@ -164,26 +196,33 @@ def pack_payload(
 
     Layout: `<u32 header_len little-endian><utf-8 json header><concatenated ipc streams>`.
     """
-    body = io.BytesIO()
-    layer_headers = []
-    for layer in serialized_layers:
-        ipc_bytes = _table_to_ipc_bytes(layer.table)
-        layer_headers.append(
-            {
-                "id": layer.layer_id,
-                "type": layer.layer_type,
-                "props": layer.props,
-                "byteOffset": body.tell(),
-                "byteLength": len(ipc_bytes),
-            }
-        )
-        body.write(ipc_bytes)
+    with span("pack_payload"):
+        body = io.BytesIO()
+        layer_headers = []
+        for layer in serialized_layers:
+            with span(f"pack_payload.write_ipc[{layer.layer_id}]"):
+                ipc_bytes = _table_to_ipc_bytes(layer.table)
+            layer_headers.append(
+                {
+                    "id": layer.layer_id,
+                    "type": layer.layer_type,
+                    "props": layer.props,
+                    "byteOffset": body.tell(),
+                    "byteLength": len(ipc_bytes),
+                }
+            )
+            body.write(ipc_bytes)
 
-    header = {
-        "layers": layer_headers,
-        "viewState": view_state,
-        "mapOptions": map_options,
-    }
-    header_json = json.dumps(header).encode("utf-8")
+        header = {
+            "v": PAYLOAD_FORMAT_VERSION,
+            "layers": layer_headers,
+            "viewState": view_state,
+            "mapOptions": map_options,
+        }
+        header_json = json.dumps(header).encode("utf-8")
 
-    return struct.pack("<I", len(header_json)) + header_json + body.getvalue()
+        payload = struct.pack("<I", len(header_json)) + header_json + body.getvalue()
+
+    log("pack_payload: %d bytes total, %d layers", len(payload), len(serialized_layers))
+
+    return payload

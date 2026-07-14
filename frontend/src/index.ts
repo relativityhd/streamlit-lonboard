@@ -47,6 +47,19 @@ function toUint8Array(data: unknown): Uint8Array {
   throw new Error("streamlit-lonboard: expected a raw bytes payload from Python");
 }
 
+/** Mirrors the ST_LONBOARD_PERF=1 spans logged Python-side (see _perf.py). */
+function logPerfSummary(): void {
+  const measures = performance
+    .getEntriesByType("measure")
+    .filter((entry) => entry.name.startsWith("st-lonboard:"))
+    .map((entry) => ({ span: entry.name.replace(/^st-lonboard:/, ""), ms: entry.duration.toFixed(2) }));
+  if (measures.length > 0) {
+    console.table(measures);
+  }
+  performance.clearMarks();
+  performance.clearMeasures();
+}
+
 function pickPayload(subLayerLookup: Map<string, SubLayerInfo>, info: PickingInfo | null) {
   if (!info || !info.picked || !info.layer) return null;
   const subLayerInfo = subLayerLookup.get(info.layer.id);
@@ -133,6 +146,8 @@ function ensureMount(component: ComponentApi, header: ContainerHeader): MountSta
 }
 
 export default function mount(component: ComponentApi): () => void {
+  performance.mark("st-lonboard:mount:start");
+
   const bytes = toUint8Array(component.data);
   const { header, layers } = parseContainer(bytes);
   const state = ensureMount(component, header);
@@ -142,7 +157,11 @@ export default function mount(component: ComponentApi): () => void {
   for (const { header: layerHeader, table } of layers) {
     deckLayers.push(...buildDeckLayers(layerHeader, table, state.subLayerLookup));
   }
+
+  performance.mark("st-lonboard:setProps:start");
   state.overlay.setProps({ layers: deckLayers });
+  performance.mark("st-lonboard:setProps:end");
+  performance.measure("st-lonboard:setProps", "st-lonboard:setProps:start", "st-lonboard:setProps:end");
 
   const basemapStyle = header.mapOptions.basemapStyle ?? DEFAULT_BASEMAP_STYLE;
   if (basemapStyle !== state.lastBasemapStyle) {
@@ -154,6 +173,12 @@ export default function mount(component: ComponentApi): () => void {
   if (state.container.style.height !== `${height}px`) {
     state.container.style.height = `${height}px`;
     state.map.resize();
+  }
+
+  performance.mark("st-lonboard:mount:end");
+  performance.measure("st-lonboard:mount", "st-lonboard:mount:start", "st-lonboard:mount:end");
+  if (header.mapOptions.perf) {
+    logPerfSummary();
   }
 
   return () => {
