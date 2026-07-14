@@ -9,6 +9,33 @@
         "exec env PYTHONFAULTHANDLER=1 uv run streamlit run examples/app.py --server.headless true"
       ],
       "port": 8501
+    },
+    {
+      "name": "bench-10k",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 ST_LONBOARD_PERF=1 BENCH_N=10000 uv run streamlit run benchmarks/bench_app.py --server.headless true > /tmp/bench_10k.log 2>&1"
+      ],
+      "port": 8501
+    },
+    {
+      "name": "bench-100k",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 ST_LONBOARD_PERF=1 BENCH_N=100000 uv run streamlit run benchmarks/bench_app.py --server.headless true > /tmp/bench_100k.log 2>&1"
+      ],
+      "port": 8501
+    },
+    {
+      "name": "bench-1m",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 ST_LONBOARD_PERF=1 BENCH_N=1000000 uv run streamlit run benchmarks/bench_app.py --server.headless true > /tmp/bench_1m.log 2>&1"
+      ],
+      "port": 8501
     }
   ]
 }

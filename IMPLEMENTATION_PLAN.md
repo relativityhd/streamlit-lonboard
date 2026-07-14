@@ -128,52 +128,64 @@ original one-liners turned out to be wrong or already-solved when we read
 Streamlit's internals, so each optimization below is gated on a measured
 baseline proving it matters.
 
-**What we already know from reading Streamlit 1.59 internals** (verify at runtime in 4.0):
+**Confirmed at runtime (see `benchmarks/RESULTS.md` for full numbers/methodology):**
 
-- Streamlit has a `ForwardMsgCache` (`runtime/forward_msg_cache.py`): any
-  ForwardMsg ≥ `global.minCachedMessageSize` (default 10 KB) is BLAKE2b-hashed
-  and, when a byte-identical message is enqueued again, the client receives a
-  tiny `ref_hash` message instead of the payload. **If this works for
-  BidiComponent deltas, "rerun re-transfers the full dataset" — the headline
-  fear in §2 — is already solved by Streamlit itself**, and Phase 4a/4b shrink
-  to "make the payload byte-identical across reruns" (deterministic
-  serialization) plus skipping redundant CPU work on both sides.
-- Even with a `ref_hash` hit, two per-rerun costs remain on the Python side:
-  (1) our serialization pipeline (arro3→pyarrow C-stream conversion, `select`,
-  `append_column`, IPC write, payload concat) and (2) Streamlit hashing the
-  payload twice per rerun (`calc_hash(proto.bytes)` for element identity in
-  `_build_bidi_identity_kwargs` — happens even when a user `key` is set — and
-  again in `populate_hash_if_needed`). BLAKE2b runs ~1 GB/s, so hashing alone
-  is ~100 ms/rerun at 10M points × 2 hashes. There is no knob to skip these;
-  they bound the achievable rerun latency and the benchmarks must report them
-  separately so we know what's ours to fix vs. Streamlit's.
-- On the frontend, `tableFromIPC` is near-zero-copy (cheap); the real per-rerun
-  cost is deck.gl layer reconstruction — GPU buffer re-upload and, for
-  `SolidPolygonLayer`, earcut re-tessellation in the worker pool. Our `mount()`
-  currently rebuilds all layers whenever CCv2 re-invokes it, even for
-  byte-identical data (new `Uint8Array` reference → new parsed objects → deck.gl
-  prop diffing sees new identities and re-uploads everything).
+- Streamlit's `ForwardMsgCache` (`runtime/forward_msg_cache.py`) does dedupe
+  our BidiComponent payload: verified via `--logger.level=debug` that a rerun
+  with byte-identical `st_lonboard()` output logs `Sending cached message ref`
+  with a stable hash. **"Rerun re-transfers the full dataset" — the headline
+  fear in §2 — is already solved by Streamlit itself, gated entirely on our
+  serialization being byte-deterministic.**
+- **Bigger than expected: on an unchanged rerun, the client doesn't just reuse
+  cached bytes — it skips invoking our frontend's `mount()` callback
+  entirely.** Confirmed directly (temporary diagnostic log, since removed):
+  zero frontend perf spans and zero `mount()` invocations on a byte-identical
+  rerun, at both 10k and 1M points, even though Python re-runs the script and
+  re-serializes every time. This means Phase 4b's frontend cache is *not*
+  needed for the "nothing changed" case — only for "one of several layers
+  changed," where a real `mount()` fires and can still avoid rebuilding the
+  *unchanged* layers.
+- Two per-rerun costs remain on the Python side regardless of the above,
+  because Python has no way to know the output will be identical without
+  actually producing it and having Streamlit hash it:
+  1. our own serialization (`serialize_layers` + `pack_payload`'s IPC write) —
+     measured ~25ms at 1M points, and *is* skippable with a cache (4a).
+  2. Streamlit's own identity/`ForwardMsgCache` hashing inside `_mount()` —
+     measured **100-280ms at 1M points (23MB payload)**, i.e. slower than one
+     BLAKE2b pass over that data "should" take, consistent with it being two
+     full hash passes (once for our component-identity computation, once
+     inside `populate_hash_if_needed` after re-serializing the whole protobuf
+     message). This is entirely inside Streamlit's code path — not ours to
+     skip, and the single largest fixed per-rerun cost at scale.
+- On the frontend, `tableFromIPC`/`parseContainer` scales with N (~15ms at 1M)
+  but `buildDeckLayers`/`setProps` stay flat and near-zero (~0.2-0.3ms even at
+  1M points) — GeoArrow's zero-copy design means layer construction hands
+  deck.gl typed-array views directly rather than iterating per point in JS.
+  The earcut/`SolidPolygonLayer` re-tessellation cost anticipated below was
+  not exercised by this baseline (single-layer scatterplot); still relevant
+  for 4b's "partial layer change" case.
 
 #### 4.0 — Baseline measurements (do first; no optimization until this lands)
 
-- [ ] Instrument, behind a `ST_LONBOARD_PERF=1` env var: Python-side
+- [x] Instrument, behind a `ST_LONBOARD_PERF=1` env var: Python-side
   `perf_counter` spans for serialize/pack (report per-layer), and frontend
   `performance.mark`/`measure` spans for parse/buildLayers/setProps (readable
-  from the browser console and Playwright).
-- [ ] Verify the `ForwardMsgCache` hypothesis end-to-end: run the example app,
-  trigger reruns with unchanged data, and confirm in the browser (WebSocket
-  frames or Network tab) whether the multi-MB delta is re-sent or replaced by
-  `ref_hash`. Also confirm what CCv2 hands our `mount()` on a `ref_hash` hit —
-  same bytes object or a fresh copy — since that determines whether a frontend
-  content-hash is even needed or a reference-equality check suffices.
-- [ ] Check whether our serialization is already byte-deterministic for
-  unchanged inputs (dict ordering in the JSON header, Arrow IPC layout,
-  schema metadata). If not, make it so — determinism is what makes
-  `ForwardMsgCache` and every content-hash below actually hit.
-- [ ] Record the baseline table (10k / 100k / 1M points): serialize ms, hash
-  ms, wire bytes, parse ms, layer-build ms, rerun-with-unchanged-data ms.
+  from the browser console and Playwright). (`_perf.py`; Streamlit's own
+  `--logger.level` doesn't reach third-party logger namespaces, so `_perf.py`
+  attaches its own stderr handler when the env var is set.)
+- [x] Verify the `ForwardMsgCache` hypothesis end-to-end — done via
+  `--logger.level=debug` server-side log inspection rather than WebSocket
+  frame capture (CCv2's dev tooling doesn't expose raw frames easily); see
+  findings above.
+- [x] Check whether our serialization is already byte-deterministic — it was
+  **not**: found and fixed a real bug (arro3's extension metadata key order
+  is randomized per construction; see `_canonicalize_table` and
+  `test_serialize_layer_is_byte_deterministic`).
+- [x] Record the baseline table (10k / 100k / 1M points) — `benchmarks/RESULTS.md`.
 - Exit criteria: a table in `benchmarks/RESULTS.md` we can diff optimizations
-  against, and a definitive yes/no on wire-level re-transfer.
+  against, and a definitive yes/no on wire-level re-transfer. **Met** — wire
+  re-transfer is deduped (yes), and frontend re-parse is *also* skipped
+  entirely for unchanged data (better than the exit criteria asked for).
 
 #### 4a — Python-side serialization cache
 
@@ -198,11 +210,13 @@ baseline proving it matters.
 
 #### 4b — Frontend cache: skip redundant parse and layer rebuild
 
-- [ ] In `mount()`, fingerprint the incoming payload (reference equality first,
-  then byteLength + FNV-1a over the bytes — ~GB/s in JS, no dependency) and
-  skip parse+rebuild entirely when unchanged. This kills re-tessellation and
-  GPU re-upload on unrelated reruns, including every `return_view_state`
-  rerun.
+**Scope reduced by the 4.0 finding**: CCv2 already skips calling `mount()` at
+all when the whole payload is byte-identical, so the "unrelated rerun redoes
+everything" case (including every `return_view_state` rerun with nothing
+else changing) is already free. What's left for 4b is the case where
+`mount()` *does* fire because *something* changed — e.g. one of several
+layers — and rebuilds every layer instead of just the changed one.
+
 - [ ] Per-layer granularity: the header already carries per-layer
   `byteOffset`/`byteLength`, so fingerprint each layer's slice and rebuild only
   changed layers (common case: one big static layer + one small dynamic one).
@@ -211,9 +225,10 @@ baseline proving it matters.
 - [ ] Keep `subLayerLookup` consistent when only a subset of layers rebuilds.
 - [ ] Guard the cache by `key`-stability: cache lives on the mount state, which
   already resets on remount.
-- Exit criteria: measured layer-build time ~0 ms on unchanged data;
-  pan/zoom with `return_view_state=True` no longer re-tessellates polygons
-  (visible in the 4.0 perf spans).
+- Exit criteria: in a multi-layer map where only one layer's data changes
+  between reruns, measured `buildDeckLayers` time for the *unchanged* layers
+  drops to ~0 ms (visible in the 4.0 perf spans) instead of rebuilding
+  everything.
 
 #### 4c — Benchmarks vs `st.pydeck_chart` (publish in README)
 
