@@ -122,10 +122,162 @@ def st_lonboard(
 - [x] View state reporting behind `return_view_state` flag (throttled ~200ms; each report still triggers a rerun — documented cost, not yet mitigated).
 
 ### Phase 4 — Performance & robustness
-- [ ] Serialization cache + frontend content-hash cache (skip redundant transfer/parse).
-- [ ] Benchmarks vs `st.pydeck_chart` (10k / 100k / 1M / 10M features) — publish results in README.
-- [ ] Optional Parquet compression for remote deployments.
-- [x] Error surfaces: unsupported layer types raise a clear `ValueError` (`serialize.serialize_layer`). Missing CRS / mixed geometry types not yet handled explicitly.
+
+Ordered so that measurement comes first: several of the assumptions behind the
+original one-liners turned out to be wrong or already-solved when we read
+Streamlit's internals, so each optimization below is gated on a measured
+baseline proving it matters.
+
+**What we already know from reading Streamlit 1.59 internals** (verify at runtime in 4.0):
+
+- Streamlit has a `ForwardMsgCache` (`runtime/forward_msg_cache.py`): any
+  ForwardMsg ≥ `global.minCachedMessageSize` (default 10 KB) is BLAKE2b-hashed
+  and, when a byte-identical message is enqueued again, the client receives a
+  tiny `ref_hash` message instead of the payload. **If this works for
+  BidiComponent deltas, "rerun re-transfers the full dataset" — the headline
+  fear in §2 — is already solved by Streamlit itself**, and Phase 4a/4b shrink
+  to "make the payload byte-identical across reruns" (deterministic
+  serialization) plus skipping redundant CPU work on both sides.
+- Even with a `ref_hash` hit, two per-rerun costs remain on the Python side:
+  (1) our serialization pipeline (arro3→pyarrow C-stream conversion, `select`,
+  `append_column`, IPC write, payload concat) and (2) Streamlit hashing the
+  payload twice per rerun (`calc_hash(proto.bytes)` for element identity in
+  `_build_bidi_identity_kwargs` — happens even when a user `key` is set — and
+  again in `populate_hash_if_needed`). BLAKE2b runs ~1 GB/s, so hashing alone
+  is ~100 ms/rerun at 10M points × 2 hashes. There is no knob to skip these;
+  they bound the achievable rerun latency and the benchmarks must report them
+  separately so we know what's ours to fix vs. Streamlit's.
+- On the frontend, `tableFromIPC` is near-zero-copy (cheap); the real per-rerun
+  cost is deck.gl layer reconstruction — GPU buffer re-upload and, for
+  `SolidPolygonLayer`, earcut re-tessellation in the worker pool. Our `mount()`
+  currently rebuilds all layers whenever CCv2 re-invokes it, even for
+  byte-identical data (new `Uint8Array` reference → new parsed objects → deck.gl
+  prop diffing sees new identities and re-uploads everything).
+
+#### 4.0 — Baseline measurements (do first; no optimization until this lands)
+
+- [ ] Instrument, behind a `ST_LONBOARD_PERF=1` env var: Python-side
+  `perf_counter` spans for serialize/pack (report per-layer), and frontend
+  `performance.mark`/`measure` spans for parse/buildLayers/setProps (readable
+  from the browser console and Playwright).
+- [ ] Verify the `ForwardMsgCache` hypothesis end-to-end: run the example app,
+  trigger reruns with unchanged data, and confirm in the browser (WebSocket
+  frames or Network tab) whether the multi-MB delta is re-sent or replaced by
+  `ref_hash`. Also confirm what CCv2 hands our `mount()` on a `ref_hash` hit —
+  same bytes object or a fresh copy — since that determines whether a frontend
+  content-hash is even needed or a reference-equality check suffices.
+- [ ] Check whether our serialization is already byte-deterministic for
+  unchanged inputs (dict ordering in the JSON header, Arrow IPC layout,
+  schema metadata). If not, make it so — determinism is what makes
+  `ForwardMsgCache` and every content-hash below actually hit.
+- [ ] Record the baseline table (10k / 100k / 1M points): serialize ms, hash
+  ms, wire bytes, parse ms, layer-build ms, rerun-with-unchanged-data ms.
+- Exit criteria: a table in `benchmarks/RESULTS.md` we can diff optimizations
+  against, and a definitive yes/no on wire-level re-transfer.
+
+#### 4a — Python-side serialization cache
+
+- [ ] Cache `serialize_layer` output keyed on layer identity. Two-level design:
+  - L1: `WeakKeyDictionary[layer, SerializedLayer]` — hits when the user reuses
+    the layer object across reruns (i.e. built it under `st.cache_resource`).
+    Invalidation: lonboard layers are ipywidgets with observable traits; hook
+    trait-change notifications to evict, or include a cheap traits fingerprint
+    in the key.
+  - L2 (only if 4.0 shows L1 misses dominate in practice): content fingerprint
+    of the underlying arro3 table — `id(layer.table)` is a good proxy since
+    lonboard tables are effectively immutable after construction; fall back to
+    (schema, num_rows, chunk buffer addresses) if `id()` proves too weak.
+- [ ] The common Streamlit pattern rebuilds the GeoDataFrame *and* the layer
+  every rerun, which no cache on our side can fix — document the
+  `st.cache_resource`-wrapped-layer-factory pattern prominently in the README
+  (this is likely worth more than the cache itself) and add it to
+  `examples/app.py`.
+- [ ] Re-measure against 4.0 baseline; record hit/miss deltas.
+- Exit criteria: rerun with unchanged data spends ~0 ms in our serialize path
+  on an L1 hit; example app demonstrates the cached pattern.
+
+#### 4b — Frontend cache: skip redundant parse and layer rebuild
+
+- [ ] In `mount()`, fingerprint the incoming payload (reference equality first,
+  then byteLength + FNV-1a over the bytes — ~GB/s in JS, no dependency) and
+  skip parse+rebuild entirely when unchanged. This kills re-tessellation and
+  GPU re-upload on unrelated reruns, including every `return_view_state`
+  rerun.
+- [ ] Per-layer granularity: the header already carries per-layer
+  `byteOffset`/`byteLength`, so fingerprint each layer's slice and rebuild only
+  changed layers (common case: one big static layer + one small dynamic one).
+  Reuse prior `Table`/deck.gl layer instances for unchanged slices so deck.gl's
+  prop diffing sees stable identities.
+- [ ] Keep `subLayerLookup` consistent when only a subset of layers rebuilds.
+- [ ] Guard the cache by `key`-stability: cache lives on the mount state, which
+  already resets on remount.
+- Exit criteria: measured layer-build time ~0 ms on unchanged data;
+  pan/zoom with `return_view_state=True` no longer re-tessellates polygons
+  (visible in the 4.0 perf spans).
+
+#### 4c — Benchmarks vs `st.pydeck_chart` (publish in README)
+
+- [ ] `benchmarks/` directory: data generators (synthetic points at 10k / 100k
+  / 1M / 10M; polygon set for tessellation cost), one Streamlit app per
+  contender (`st_lonboard`, `st.pydeck_chart`, and `Map.to_html()` via
+  `components.v1.html` as the workaround people use today).
+- [ ] Driver: Playwright (shared with Phase 5 test infra) measuring
+  time-to-first-render (navigation → first deck.gl `onAfterRender`),
+  rerun-with-unchanged-data latency, and interaction-triggered rerun latency;
+  Python-side spans and wire sizes from the 4.0 instrumentation.
+- [ ] Expect pydeck to DNF at 1M+ (browser OOM or minutes-long JSON parse) —
+  report DNFs honestly rather than extrapolating.
+- [ ] Report environment (hardware, versions, localhost transport) and publish
+  the table + methodology in README; keep raw numbers in
+  `benchmarks/RESULTS.md`.
+- Exit criteria: reproducible one-command benchmark run; README table.
+
+#### 4d — Optional compression for remote deployments
+
+- [ ] **Confirmed constraint:** arrow-js (v17, bundled) throws
+  `"Record batch compression not implemented"` — Arrow IPC buffer compression
+  (zstd/lz4) is a dead end for the frontend. Realistic options:
+  1. Whole-payload gzip/deflate: `zlib` in Python, native `DecompressionStream`
+     in every modern browser — zero new dependencies on either side. Likely
+     winner on simplicity; ~100 MB/s compress, so only worth it off-localhost.
+  2. Parquet + `parquet-wasm` (lonboard's approach): better ratios on
+     coordinates, but adds a ~1 MB WASM module, async init, and a second
+     decode path. Only pursue if gzip ratios disappoint on real datasets.
+- [ ] Before any of this: add a format-version field to the payload header
+  (`"v": 1`) plus a `"compression"` field so old frontends fail loudly rather
+  than mis-parse. (Do this versioning change in 4.0 — it must land before any
+  format evolution.)
+- [ ] API: `st_lonboard(compression="auto" | "gzip" | None)`, default `"auto"`
+  = compress only above a size threshold; document that localhost users should
+  leave it off (IPC beats gzip+decode locally, per §2's original analysis).
+- [ ] Measure ratio + added latency on the benchmark datasets; publish
+  alongside 4c.
+- Exit criteria: measured decision documented (even if the decision is "gzip
+  only, Parquet not worth it" — or "none of it is worth it").
+
+#### 4e — Robustness & error surfaces
+
+- [x] Unsupported layer types raise a clear `ValueError` (`serialize.serialize_layer`).
+- [ ] Payload size guard: fail in Python with an actionable message when the
+  payload exceeds Streamlit's `server.maxMessageSize` (default 200 MB) instead
+  of letting the WebSocket die opaquely; mention the config knob and
+  downsampling in the error text.
+- [ ] CRS: warn when a layer's geometry column has no CRS or a non-EPSG:4326
+  CRS in its GeoArrow extension metadata (deck.gl assumes lon/lat WGS84;
+  lonboard's `from_geopandas` reprojects, but raw-table construction doesn't).
+- [ ] Geometry edge cases with tests: empty table (0 rows), null geometries,
+  Point vs MultiPoint in one dataset (GeoArrow columns are homogeneous by
+  construction, so this is about verifying the Multi* variants render, not
+  about mixed columns).
+- [ ] Frontend errors: wrap per-layer build in try/catch so one bad layer
+  degrades to a console error + skipped layer instead of taking down the whole
+  component via the BidiComponent error boundary; include layer id and type in
+  every error message.
+- [ ] Multiple `st_lonboard` instances in one app (with and without keys) —
+  verify no identity collisions or cross-instance state bleed; add a smoke
+  test.
+- Exit criteria: every failure mode above produces a message that names the
+  offending layer and says what to do about it; none of them crash the app.
 
 ### Phase 5 — Release
 - [x] Unit tests for `serialize.py` (`tests/test_serialize.py`, pytest). Frontend/playwright smoke tests, CI, docs site not yet done.
@@ -139,7 +291,7 @@ def st_lonboard(
 | CCv2 API still maturing / min version too new       | Users on older Streamlit can't install | Document min version; no v1 fallback (v1 + JSON defeats the purpose)                  |
 | Bytes-in-dict unsupported in `data`                 | Container format broken                | Phase 0 spike; single-blob + offsets fallback                                         |
 | Lonboard internal APIs (traitlet extraction) change | Breakage on lonboard upgrades          | Depend on public attrs where possible; pin compatible range; CI against lonboard main |
-| Rerun-triggered re-transfer of large data           | Perf regression vs Jupyter             | Content-hash caching both sides (Phase 4)                                             |
+| Rerun-triggered re-work on large data — reading Streamlit internals suggests wire re-transfer is already deduped by `ForwardMsgCache` (`ref_hash`), leaving per-rerun CPU as the real cost: our re-serialization, Streamlit's double BLAKE2b hash of the payload, frontend re-parse + deck.gl rebuild/re-tessellation | Perf regression vs Jupyter | Verify `ForwardMsgCache` behavior at runtime, then cache both sides (Phase 4.0/4a/4b); the double hash is Streamlit-internal and only mitigable by keeping payloads byte-deterministic |
 | View-state feedback loop (report → rerun → reset)   | Janky UX                               | Frontend owns view state; Python override only on explicit change                     |
 | pyarrow 25.0.0 bundles mimalloc 3.3.1, which SIGSEGVs when libarrow is first loaded on a non-main thread that then exits — Streamlit's exact execution model (fresh ScriptRunner thread per run). Found while debugging "dev server crashes when panning"; upstream [apache/arrow#50471](https://github.com/apache/arrow/issues/50471) / [microsoft/mimalloc#1287](https://github.com/microsoft/mimalloc/issues/1287), deterministic 5-line repro, no fixed release yet | Crashes the whole Python process, no traceback unless `PYTHONFAULTHANDLER=1` | `pyarrow>=14,!=25.0.0` in `pyproject.toml` (A/B-verified: pa25+mimalloc crashes ≤3 reruns; pa25+system-pool, pa24 on py3.13, and pa24 on py3.14 each survive 190-240 scripted reruns). Drop the exclusion when a fixed release ships; `ARROW_DEFAULT_MEMORY_POOL=system` works around it if 25.0.0 is forced |
 
