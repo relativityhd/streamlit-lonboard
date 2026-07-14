@@ -8,10 +8,7 @@ version = "0.1.0.dev0"
 description = "Streamlit component for lonboard: fast GeoArrow/deck.gl maps without GeoJSON"
 readme = "README.md"
 license = "MIT"
-# <3.14: current pyarrow (25.0.0, see the pyarrow<20 note below) has no wheels
-# for cp314 and fails to build from source without a full C++ toolchain, so
-# 3.14 forces you onto the exact pyarrow release this project avoids.
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10"
 authors = [{ name = "Tobias Hoelzer" }]
 keywords = ["streamlit", "lonboard", "deckgl", "geoarrow", "geospatial"]
 dependencies = [
@@ -19,18 +16,18 @@ dependencies = [
     # verified against streamlit==1.59.2. Older 1.49-1.58 may work but are untested.
     "streamlit>=1.59",
     "lonboard>=0.10",
-    # <20: pyarrow 25.0.0 (the only build available for Python 3.14, and also
-    # what a plain `pyarrow>=14` resolves to on 3.10-3.13) has an intermittent
-    # native segfault in its pandas/GeoDataFrame-to-Arrow conversion path
-    # (pa.Table.from_pandas, reached via lonboard's geopandas_to_geoarrow)
-    # when called from a background thread - which is exactly how Streamlit
-    # runs every script (ScriptRunner thread) alongside its file-watcher
-    # threads. It's racy, not deterministic: reproduced on the very first
-    # render in some runs, only after several reruns (e.g. triggered by
-    # panning with return_view_state=True) in others. Confirmed pyarrow
-    # 19.0.1 does not exhibit it across 100+ stress-test reruns; versions
-    # 20-24 are untested and not assumed safe.
-    "pyarrow>=14,<20",
+    # !=25.0.0: that release bundles mimalloc 3.3.1, which SIGSEGVs when
+    # libarrow is first loaded on a non-main thread that then exits - exactly
+    # what Streamlit does (each script run, including the first import of
+    # pyarrow, happens on a fresh ScriptRunner thread). Crashes the whole
+    # process on/near the first rerun; deterministic 5-line repro in
+    # https://github.com/apache/arrow/issues/50471 (root cause
+    # https://github.com/microsoft/mimalloc/issues/1287). pyarrow 24.0.0
+    # (mimalloc 3.2.7) verified clean on Python 3.13 and 3.14 with 190+
+    # scripted reruns each; drop the exclusion once a release with the
+    # mimalloc fix ships. Workaround if something forces 25.0.0 on you:
+    # ARROW_DEFAULT_MEMORY_POOL=system.
+    "pyarrow>=14,!=25.0.0",
 ]
 
 [project.optional-dependencies]

@@ -4,7 +4,7 @@ A Streamlit custom component for [lonboard](https://github.com/developmentseed/l
 
 > **Status: early development.** Scatterplot/Path/Polygon/SolidPolygon layers, multi-layer maps, click/hover picking, and view-state persistence across reruns all work. Heatmap is wired but untested; Bitmap/Raster layers aren't supported yet. See [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) for the roadmap and progress.
 >
-> **Requires Python <3.14 and pyarrow <20** (both enforced in `pyproject.toml`). Newer pyarrow has an intermittent native segfault converting GeoDataFrames to Arrow from a background thread — exactly how Streamlit runs your script — and 3.14 forces that pyarrow version since no older one ships a wheel for it. See the comments next to `requires-python`/`pyarrow` in [pyproject.toml](./pyproject.toml).
+> **pyarrow 25.0.0 is excluded** (`pyarrow>=14,!=25.0.0` in `pyproject.toml`): its bundled mimalloc 3.3.1 segfaults when libarrow is first loaded on a non-main thread that then exits — which is exactly how Streamlit runs every script. Known upstream as [apache/arrow#50471](https://github.com/apache/arrow/issues/50471) / [microsoft/mimalloc#1287](https://github.com/microsoft/mimalloc/issues/1287); no fixed release yet. If another dependency forces 25.0.0 on you, set `ARROW_DEFAULT_MEMORY_POOL=system` as a workaround. All Python versions ≥3.10 (including 3.14) are supported.
 
 ## Why?
 
