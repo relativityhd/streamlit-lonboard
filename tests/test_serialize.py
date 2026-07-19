@@ -14,8 +14,8 @@ import geopandas as gpd
 import numpy as np
 import pyarrow as pa
 import pytest
-from lonboard import PathLayer, ScatterplotLayer
-from shapely.geometry import LineString, MultiPoint, Point
+from lonboard import PathLayer, ScatterplotLayer, SolidPolygonLayer
+from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon
 
 
 def _load_module(pkg_dir: Path, name: str):
@@ -265,6 +265,36 @@ def test_check_payload_size_raises_actionable_error_over_limit():
     assert "Downsample" in message
     assert "compression=" in message
     assert "server.maxMessageSize" in message
+
+
+def test_serialize_layer_produces_valid_ipc_for_multi_chunk_polygon_layer():
+    """Regression test for docs/agents/lonboard-multi-batch-bug.md: lonboard
+    rechunks large tables into zero-copy slices, and pyarrow's C++ IPC writer
+    can corrupt a sliced variable-size-list column (Polygon/MultiPolygon/Path
+    geometry) by keeping absolute, non-rebased offsets into a truncated child
+    array (https://github.com/apache/arrow/issues/46407). That produces an
+    IPC stream that's invalid on read-back and renders nothing in the
+    frontend, silently. `_rows_per_chunk=2` forces the same multi-chunk
+    rechunk a large real table gets automatically.
+    """
+
+    def sq(x: int):
+        return Polygon([(x, 0), (x + 0.5, 0), (x + 0.5, 0.5), (x, 0.5)])
+
+    gdf = gpd.GeoDataFrame(geometry=[MultiPolygon([sq(i)]) for i in range(6)], crs="EPSG:4326")
+    layer = SolidPolygonLayer.from_geopandas(
+        gdf, get_fill_color=np.full((6, 4), 128, dtype="uint8"), _rows_per_chunk=2
+    )
+    assert pa.table(layer.table).column("geometry").num_chunks > 1  # precondition: the bug needs >1 chunk
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    reader = pa.ipc.open_stream(serialized.ipc_bytes)
+    batches = list(reader)
+    assert len(batches) == 1  # combine_chunks() collapses the rechunk before writing
+    for batch in batches:
+        batch.validate(full=True)  # raises if offsets/child-array lengths are inconsistent
+    assert sum(batch.num_rows for batch in batches) == 6
 
 
 def test_serialize_layer_handles_null_geometry():

@@ -174,6 +174,25 @@ def _canonicalize_table(table: pa.Table) -> pa.Table:
 
 
 def _table_to_ipc_bytes(table: pa.Table) -> bytes:
+    """Write `table` as a single-record-batch Arrow IPC stream.
+
+    `combine_chunks()` first: lonboard auto-rechunks large tables (via
+    arro3's Rust rechunk), which produces zero-copy slices - each chunk after
+    the first is a variable-size-list array (Polygon/MultiPolygon/Path
+    geometry, or any list-offset column) whose offsets are absolute into a
+    since-truncated child array. pyarrow's C++ IPC writer doesn't always
+    rebase those offsets when writing a sliced chunk, producing a stream
+    that's invalid on read-back (`batch.validate(full=True)` fails) - this is
+    an upstream bug (https://github.com/apache/arrow/issues/46407), not
+    something arro3 or our own table-building does wrong. The frontend has no
+    way to detect the corruption; it just throws inside deck.gl's assert()
+    and silently renders nothing. `combine_chunks()` forces a single,
+    freshly-compacted chunk per column with correctly-rebased offsets,
+    sidestepping the bug regardless of which pyarrow version is installed
+    (fixed-size geometry, e.g. Point, was never affected - no offsets buffer
+    to corrupt in the first place).
+    """
+    table = table.combine_chunks()
     sink = io.BytesIO()
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
