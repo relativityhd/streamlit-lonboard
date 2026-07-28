@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Version bump"
+        description: 'Version bump'
         required: true
         type: choice
         options:
@@ -26,7 +26,7 @@ on:
           - stable
         default: patch
       dry_run:
-        description: "Dry run: build and show the diff, but do not tag, push, or publish"
+        description: 'Dry run: build and show the diff, but do not tag, push, or publish'
         type: boolean
         default: false
 
@@ -39,7 +39,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NODE_VERSION: "22"
+  NODE_VERSION: '22'
 
 jobs:
   # Reuses .github/workflows/ci.yml verbatim - lint, the test matrix, the
@@ -69,7 +69,7 @@ jobs:
           # Full history so the tag lands on a real ancestry, not a shallow graft.
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
 
@@ -113,7 +113,7 @@ jobs:
 
       - name: Build sdist and wheel
         env:
-          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: "1"
+          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: '1'
         run: uv build
 
       - name: Check package metadata

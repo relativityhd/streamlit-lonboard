@@ -19,7 +19,7 @@ concurrency:
 env:
   # Pinned rather than floating so a Node release cannot change the shipped
   # bundle without a visible commit here.
-  NODE_VERSION: "22"
+  NODE_VERSION: '22'
 
 jobs:
   lint:
@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
 
@@ -47,18 +47,18 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
         include:
           # The package is pure Python, so one cross-platform smoke test per
           # non-Linux OS is enough to catch path/encoding mistakes.
           - os: macos-latest
-            python-version: "3.12"
+            python-version: '3.12'
           - os: windows-latest
-            python-version: "3.12"
+            python-version: '3.12'
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -68,7 +68,7 @@ jobs:
         # skips the Hatchling frontend hook and keeps Node off the matrix
         # entirely. The frontend is built and typechecked in its own job below.
         env:
-          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: "1"
+          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: '1'
         run: uv sync --extra dev
 
       - name: Pytest
@@ -112,7 +112,7 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
 
@@ -126,7 +126,7 @@ jobs:
         # The bundle was just built above from the lockfile, so the Hatchling
         # hook is told to stand down rather than re-running a loose `npm install`.
         env:
-          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: "1"
+          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: '1'
         run: uv build
 
       - name: Check package metadata
