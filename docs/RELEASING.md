@@ -35,7 +35,7 @@ would break an existing `st_lonboard(...)` call is a `minor` bump pre-1.0 and a
 `.github/workflows/release.yml`, in order:
 
 1. **checks** — runs `.github/workflows/ci.yml` unchanged (ruff, the Python
-   3.10–3.14 test matrix on Linux plus macOS/Windows smoke tests, a frontend
+   3.11–3.14 test matrix on Linux plus macOS/Windows smoke tests, a frontend
    typecheck and build, and a trial packaging run). A release can only be cut
    from a commit that passes everything a PR has to pass.
 2. **release** — refuses to run off `main`; bumps the version with

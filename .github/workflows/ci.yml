@@ -32,8 +32,17 @@ jobs:
         with:
           enable-cache: true
 
+      # `uv run` (not `uvx`) so this actually honors the ruff pin below and
+      # uv.lock's resolved version - `uvx ruff` ignores the project entirely
+      # and always fetches whatever is newest on PyPI, silently defeating the
+      # pin the moment a new ruff ships with new default rules.
+      - name: Install dev dependencies
+        env:
+          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: '1'
+        run: uv sync --extra dev
+
       - name: Ruff (lint)
-        run: uvx ruff check --output-format=github .
+        run: uv run ruff check --output-format=github .
 
       # uv.lock records the project's own version too, so a stale lock is not
       # just a dependency-drift problem - it desynchronises the release bump.
@@ -47,7 +56,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.11', '3.12', '3.13', '3.14']
         include:
           # The package is pure Python, so one cross-platform smoke test per
           # non-Linux OS is enough to catch path/encoding mistakes.
