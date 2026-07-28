@@ -2458,13 +2458,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "geopandas", marker = "extra == 'dev'" },
+    { name = "geopandas", marker = "extra == 'dev'", specifier = ">=1" },
     { name = "lonboard", specifier = ">=0.10" },
     { name = "playwright", marker = "extra == 'bench'" },
     { name = "pyarrow", specifier = ">=14,!=25.0.0" },
     { name = "pydeck", marker = "extra == 'bench'" },
-    { name = "pytest", marker = "extra == 'dev'" },
-    { name = "ruff", marker = "extra == 'dev'" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15,<0.16" },
     { name = "streamlit", specifier = ">=1.59" },
 ]
 provides-extras = ["dev", "bench"]

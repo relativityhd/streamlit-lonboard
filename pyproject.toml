@@ -8,9 +8,27 @@ version = "0.1.0.dev0"
 description = "Streamlit component for lonboard: fast GeoArrow/deck.gl maps without GeoJSON"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Tobias Hoelzer" }]
 keywords = ["streamlit", "lonboard", "deckgl", "geoarrow", "geospatial"]
+# Drives PyPI's search facets and the sidebar on the project page. Keep the
+# Python versions in step with `requires-python` and the CI test matrix.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Typing :: Typed",
+]
 dependencies = [
     # Phase 0 spike: CCv2 as used here (st.components.v2, bidi_component data=bytes)
     # verified against streamlit==1.59.2. Older 1.49-1.58 may work but are untested.
@@ -31,7 +49,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "geopandas", "ruff"]
+# Version floors (not exact pins) so uv.lock stays the single source of the
+# exact versions, while CI can never silently jump to a ruff release with new
+# default rules and turn a green branch red without a commit.
+dev = ["pytest>=8", "geopandas>=1", "ruff>=0.15,<0.16"]
 # Only for benchmarks/ (Phase 4c contender comparison) - not needed to use
 # streamlit-lonboard itself. pydeck ships bundled with streamlit already;
 # listed explicitly here since benchmarks/contenders/pydeck_app.py imports it
@@ -39,8 +60,10 @@ dev = ["pytest", "geopandas", "ruff"]
 bench = ["pydeck", "playwright"]
 
 [project.urls]
+Homepage = "https://github.com/relativityhd/streamlit-lonboard"
 Repository = "https://github.com/relativityhd/streamlit-lonboard"
 Issues = "https://github.com/relativityhd/streamlit-lonboard/issues"
+Changelog = "https://github.com/relativityhd/streamlit-lonboard/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/streamlit_lonboard"]
@@ -54,7 +77,46 @@ artifacts = ["src/streamlit_lonboard/frontend_dist/**"]
 [tool.hatch.build.targets.wheel.hooks.custom]
 path = "hatch_build.py"
 
+# `uv build` builds the sdist first and then builds the wheel *from that sdist*,
+# so anything the wheel needs must survive the sdist. Two consequences:
+#
+#   - frontend/ sources are included, so `pip install` from an sdist can still
+#     run the Hatchling hook and build the bundle itself;
+#   - the already-built frontend_dist/ is force-included via `artifacts` (it is
+#     gitignored, so hatchling's VCS-aware selection would drop it). Without
+#     this, a release that pre-builds the bundle and sets
+#     STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD=1 silently produces a wheel with no
+#     assets - it imports fine and renders a blank map. Shipping it also means
+#     installing from the sdist needs no Node at all.
+#
+# Benchmarks, examples and agent notes are development-only weight, left out.
+[tool.hatch.build.targets.sdist]
+artifacts = ["src/streamlit_lonboard/frontend_dist/**"]
+include = [
+    "src/",
+    "frontend/src/",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "frontend/tsconfig.json",
+    "frontend/vite.config.ts",
+    "tests/",
+    "hatch_build.py",
+    "pyproject.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
+
 # Also mirrored in src/streamlit_lonboard/pyproject.toml - see the comment
 # there for why (CCv2's manifest scanner can't see this file for a src/ layout).
 [tool.streamlit.component]
 components = [{ name = "lonboard_map", asset_dir = "frontend_dist" }]
+
+[tool.ruff]
+# Set explicitly so a ruff upgrade cannot quietly change what "too long" means.
+line-length = 120
+extend-exclude = ["frontend", ".venv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

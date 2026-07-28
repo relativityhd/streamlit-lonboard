@@ -1,0 +1,221 @@
+name: Release
+
+# Manual, one-button release. From the GitHub UI: Actions -> Release -> Run
+# workflow -> pick a bump level. Nothing is published on an ordinary push;
+# cutting a release is always a deliberate act.
+#
+# The run, in order:
+#   1. checks   - the full CI pipeline against main, unchanged
+#   2. release  - bump the version, roll the changelog, commit, tag, push, build
+#   3. pypi     - publish to PyPI via Trusted Publishing (no API token stored)
+#   4. announce - create the GitHub Release from the changelog section
+#
+# See docs/RELEASING.md for the human-facing walkthrough.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - stable
+        default: patch
+      dry_run:
+        description: "Dry run: build and show the diff, but do not tag, push, or publish"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A second release must never interleave with one already in flight.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  # Reuses .github/workflows/ci.yml verbatim - lint, the test matrix, the
+  # frontend typecheck, and a trial build - so a release can only be cut from a
+  # commit that already passes everything a PR has to pass.
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Bump, tag and build
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release commit and the tag
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - name: Refuse to release from a non-default branch
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases must be cut from main (got ${{ github.ref }})."
+          exit 1
+
+      - uses: actions/checkout@v7
+        with:
+          # Full history so the tag lands on a real ancestry, not a shallow graft.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Bump the version
+        id: bump
+        run: |
+          set -euo pipefail
+          # --no-sync: re-lock (uv.lock carries the project version) without
+          # rebuilding the venv, which would drag in the Node frontend build.
+          uv version --no-sync --bump "${{ inputs.bump }}"
+          VERSION="$(uv version --short)"
+          TAG="v${VERSION}"
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag ${TAG} already exists - that version was already released."
+            exit 1
+          fi
+
+          # Mirrors the version into frontend/package.json and rewrites the
+          # changelog's Unreleased section. Fails loudly if that section is empty.
+          python scripts/sync_version.py sync "${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "### Releasing \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show the release diff
+        run: git --no-pager diff
+
+      - name: Build frontend bundle
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build sdist and wheel
+        env:
+          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: "1"
+        run: uv build
+
+      - name: Check package metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Verify the built artifacts match the bumped version
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.bump.outputs.version }}"
+          ls -lh dist/
+          test -f "dist/streamlit_lonboard-${VERSION}-py3-none-any.whl"
+          test -f "dist/streamlit_lonboard-${VERSION}.tar.gz"
+          python - <<'PY'
+          import glob, sys, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = set(zipfile.ZipFile(wheel).namelist())
+          missing = sorted(
+              {
+                  "streamlit_lonboard/frontend_dist/index.js",
+                  "streamlit_lonboard/frontend_dist/index.css",
+                  "streamlit_lonboard/pyproject.toml",
+              }
+              - names
+          )
+          if missing:
+              sys.exit(f"{wheel} is missing: {missing}")
+          PY
+
+      - name: Extract release notes
+        run: |
+          python scripts/sync_version.py notes "${{ steps.bump.outputs.version }}" > release-notes.md
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit, tag and push
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml uv.lock CHANGELOG.md frontend/package.json
+          git commit -m "Release ${{ steps.bump.outputs.tag }}"
+          git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
+          git push origin HEAD:main --follow-tags
+
+      - name: Dry run - nothing was tagged, pushed or published
+        if: ${{ inputs.dry_run }}
+        run: echo "::notice::Dry run for ${{ steps.bump.outputs.tag }}. Artifacts are attached to this run."
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-dist
+          path: |
+            dist/
+            release-notes.md
+
+  pypi:
+    name: Publish to PyPI
+    needs: release
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    # Configure this environment on PyPI as the Trusted Publisher environment,
+    # and (recommended) add yourself as a required reviewer in the repo settings
+    # so publishing pauses for an explicit approval.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/streamlit-lonboard
+    permissions:
+      # The only permission Trusted Publishing needs: it mints a short-lived
+      # OIDC token instead of using a long-lived API token stored as a secret.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-dist
+          path: .
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  announce:
+    name: Create GitHub Release
+    needs: [release, pypi]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-dist
+          path: .
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            dist/*

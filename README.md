@@ -6,6 +6,18 @@ A Streamlit custom component for [lonboard](https://github.com/developmentseed/l
 >
 > **pyarrow 25.0.0 is excluded** (`pyarrow>=14,!=25.0.0` in `pyproject.toml`): its bundled mimalloc 3.3.1 segfaults when libarrow is first loaded on a non-main thread that then exits — which is exactly how Streamlit runs every script. Known upstream as [apache/arrow#50471](https://github.com/apache/arrow/issues/50471) / [microsoft/mimalloc#1287](https://github.com/microsoft/mimalloc/issues/1287); no fixed release yet. If another dependency forces 25.0.0 on you, set `ARROW_DEFAULT_MEMORY_POOL=system` as a workaround. All Python versions ≥3.10 (including 3.14) are supported.
 
+## Install
+
+```sh
+uv add streamlit-lonboard
+```
+
+or via pip
+
+```sh
+pip install streamlit-lonboard
+```
+
 ## Why?
 
 Streamlit's built-in DeckGL support (`st.pydeck_chart`) goes through [pydeck](https://pydeck.gl/), which serializes data as **GeoJSON/JSON** — slow to encode, slow to transfer, slow to parse, and impractical beyond ~100k features.
@@ -137,7 +149,12 @@ uv run ruff check # lint
 
 ## License
 
-MIT
+MIT for this project's own code (Python and `frontend/src/`). The built
+`frontend_dist/index.js` bundles compiled code from deck.gl, apache-arrow,
+maplibre-gl and their transitive dependencies under their own licenses
+(mostly MIT/BSD-3-Clause, with Apache-2.0 for apache-arrow and flatbuffers);
+a generated `THIRD-PARTY-NOTICES.txt` listing them and their license texts
+ships alongside it in every wheel.
 
 ## Acknowledgements
 

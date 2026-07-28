@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets .github/workflows/release.yml run this exact pipeline as a gate before
+  # it bumps anything, instead of duplicating the job definitions there.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Superseded PR pushes are worth cancelling; a release run is not.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned rather than floating so a Node release cannot change the shipped
+  # bundle without a visible commit here.
+  NODE_VERSION: "22"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - name: Ruff (lint)
+        run: uvx ruff check --output-format=github .
+
+      # uv.lock records the project's own version too, so a stale lock is not
+      # just a dependency-drift problem - it desynchronises the release bump.
+      - name: uv.lock is up to date
+        run: uv lock --check
+
+  test:
+    name: Test (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # The package is pure Python, so one cross-platform smoke test per
+          # non-Linux OS is enough to catch path/encoding mistakes.
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (without building the frontend)
+        # The test suite exercises the Python serialization layer only, so this
+        # skips the Hatchling frontend hook and keeps Node off the matrix
+        # entirely. The frontend is built and typechecked in its own job below.
+        env:
+          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: "1"
+        run: uv sync --extra dev
+
+      - name: Pytest
+        run: uv run pytest -q
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci` (not `npm install`) so CI builds exactly what package-lock.json
+      # pins and can never silently drift onto a newer deck.gl.
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Build bundle
+        working-directory: frontend
+        run: npm run build
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - name: Build frontend bundle
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build sdist and wheel
+        # The bundle was just built above from the lockfile, so the Hatchling
+        # hook is told to stand down rather than re-running a loose `npm install`.
+        env:
+          STREAMLIT_LONBOARD_SKIP_FRONTEND_BUILD: "1"
+        run: uv build
+
+      - name: Check package metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Verify the wheel actually contains the frontend bundle
+        # Cheap guard against the failure mode that is invisible until a user
+        # installs it: a wheel that imports fine but renders a blank map.
+        run: |
+          python - <<'PY'
+          import sys, zipfile, glob
+          wheel = glob.glob("dist/*.whl")[0]
+          names = set(zipfile.ZipFile(wheel).namelist())
+          required = {
+              "streamlit_lonboard/frontend_dist/index.js",
+              "streamlit_lonboard/frontend_dist/index.css",
+              # Mirrors the [tool.streamlit.component] manifest that CCv2's
+              # scanner needs to find inside the installed package.
+              "streamlit_lonboard/pyproject.toml",
+          }
+          missing = sorted(required - names)
+          if missing:
+              sys.exit(f"{wheel} is missing: {missing}")
+          print(f"{wheel}: frontend bundle present")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ github.run_id }}
+          path: dist/
+          retention-days: 7
