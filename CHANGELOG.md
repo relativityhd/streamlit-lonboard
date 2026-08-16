@@ -19,6 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Support for lonboard's DGGS layers - `H3HexagonLayer`, `S2Layer`, `A5Layer`, and
+  `GeohashLayer` - plus `ArcLayer`, `ColumnLayer`, `PointCloudLayer`, and
+  `TripsLayer` (static frame only; drive `layer._current_time` yourself for
+  animation). ([#1](https://github.com/relativityhd/streamlit-lonboard/pull/1))
+- Layers whose geometry lives in accessor columns (DGGS cell IDs, Arc position
+  pairs) no longer require a GeoArrow geometry column in `layer.table`. A clear
+  error is raised if a required accessor is a scalar instead of a per-row array
+  (e.g. `S2Layer(get_s2_token="89c25c")`), which lonboard accepts but cannot be
+  rendered from a JSON prop.
+- `st_lonboard()` warns when it cannot compute a default view state for these
+  layer types (lonboard has no auto-viewport for S2/A5/Geohash/Arc, and H3
+  auto-centering needs `h3-py` installed) - pass an explicit `view_state=`.
+- New `examples/dggs_app.py` demonstrating H3 and Arc layers.
+
 ## [0.1.0] - 2026-07-28
 
 ### Added

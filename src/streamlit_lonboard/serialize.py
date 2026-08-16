@@ -27,6 +27,7 @@ from typing import Any, Literal
 from weakref import WeakKeyDictionary
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.ipc
 import traitlets
 
@@ -57,7 +58,43 @@ SUPPORTED_LAYER_TYPES = {
     "polygon": "polygon",
     "solid-polygon": "solid-polygon",
     "heatmap": "heatmap",
+    "h3-hexagon": "h3-hexagon",
+    "s2": "s2",
+    "a5": "a5",
+    "geohash": "geohash",
+    "arc": "arc",
+    "column": "column",
+    "point-cloud": "point-cloud",
+    "trip": "trip",
 }
+
+# Layer types whose geometry lives entirely in accessor columns (DGGS cell
+# IDs, source/target point pairs, ...) rather than a GeoArrow-encoded column
+# of `layer.table` - these are exempt from the "no geometry column" check in
+# `serialize_layer`.
+ACCESSOR_GEOMETRY_LAYER_TYPES = {"h3-hexagon", "s2", "a5", "geohash", "arc"}
+
+# For accessor-geometry layer types, the accessor(s) that must arrive as a
+# per-row Arrow array (not a JSON scalar) since they carry the geometry.
+_REQUIRED_ACCESSORS: dict[str, tuple[str, ...]] = {
+    "h3-hexagon": ("get_hexagon",),
+    "s2": ("get_s2_token",),
+    "a5": ("get_pentagon",),
+    "geohash": ("get_geohash",),
+    "arc": ("get_source_position", "get_target_position"),
+}
+
+# deck.gl prop names that don't follow the generic snake_case -> camelCase
+# rule (see `_snake_to_camel`) - e.g. a leading underscore trait.
+_PROP_NAME_OVERRIDES = {"_current_time": "currentTime"}
+
+# deck.gl attributes must fit in float32. lonboard's own ipywidgets path
+# (lonboard._serialization.serialize_timestamp_accessor) rescales trip
+# timestamps by this offset before casting to float32; we mirror that here
+# so `GeoArrowTripsLayer` receives the same values it expects from lonboard
+# proper. -16777216 is -(2**24), the largest magnitude a float32 can
+# represent exactly as an integer.
+_TRIP_TIMESTAMP_OFFSET_BASE = -16777216
 
 # Traits that are never forwarded as props (internal/comm/ipywidgets plumbing).
 _IGNORED_TRAITS = {
@@ -141,11 +178,12 @@ def build_layer_props(layer: Any) -> tuple[dict[str, Any], dict[str, pa.ChunkedA
         if value is None:
             continue
 
+        prop_name = _PROP_NAME_OVERRIDES.get(name) or _snake_to_camel(name)
         if name.startswith("get_") and _is_arrow_like(value):
             accessor_columns[name] = pa.chunked_array(value)
-            props[_snake_to_camel(name)] = {"@@arrowColumn": name}
+            props[prop_name] = {"@@arrowColumn": name}
         elif _is_json_safe(value):
-            props[_snake_to_camel(name)] = value
+            props[prop_name] = value
 
     return props, accessor_columns
 
@@ -199,6 +237,23 @@ def _table_to_ipc_bytes(table: pa.Table) -> bytes:
     return sink.getvalue()
 
 
+def _rescale_trip_timestamps(chunked: pa.ChunkedArray) -> pa.ChunkedArray:
+    """Rescale a trip layer's `get_timestamps` column to `list<float32>`.
+
+    deck.gl uploads path/trip vertex attributes as float32, so timestamps
+    (typically microsecond-precision, far outside float32's exact-integer
+    range) must first be shifted down into that range - mirroring lonboard's
+    own `serialize_timestamp_accessor` (see `_TRIP_TIMESTAMP_OFFSET_BASE`).
+    """
+    arr = chunked.combine_chunks()  # ChunkedArray.combine_chunks() -> a single Array
+    flat = pc.cast(arr.flatten(), pa.int64())
+    min_value = pc.min(flat).as_py() if len(flat) else 0
+    offset = _TRIP_TIMESTAMP_OFFSET_BASE - min_value
+    shifted = pc.cast(pc.add(flat, pa.scalar(offset, pa.int64())), pa.float32())
+    rescaled = pa.ListArray.from_arrays(arr.offsets, shifted)
+    return pa.chunked_array([rescaled])
+
+
 def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
     """Serialize a single lonboard layer into scalar props + a minimal Arrow table.
 
@@ -218,8 +273,21 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
         props, accessor_columns = build_layer_props(layer)
 
         keep_columns = _geometry_column_names(table.schema)
-        if not keep_columns:
+        if not keep_columns and layer._layer_type not in ACCESSOR_GEOMETRY_LAYER_TYPES:
             raise ValueError(f"layer {layer_id} has no GeoArrow-encoded geometry column")
+
+        for accessor_name in _REQUIRED_ACCESSORS.get(layer._layer_type, ()):
+            if accessor_name not in accessor_columns:
+                raise ValueError(
+                    f"layer {layer_id}: `{accessor_name}` must be set to an array with "
+                    f"one value per row (got a scalar) - streamlit-lonboard cannot "
+                    f"render a {layer._layer_type!r} layer without it"
+                )
+
+        if layer._layer_type == "trip" and "get_timestamps" in accessor_columns:
+            accessor_columns["get_timestamps"] = _rescale_trip_timestamps(
+                accessor_columns["get_timestamps"]
+            )
 
         out_table = table.select(keep_columns)
         for name, chunked in accessor_columns.items():

@@ -10,12 +10,31 @@ import sys
 import types
 from pathlib import Path
 
+import datetime
+
 import geopandas as gpd
 import numpy as np
 import pyarrow as pa
 import pytest
-from lonboard import PathLayer, ScatterplotLayer, SolidPolygonLayer
+from lonboard import (
+    A5Layer,
+    ArcLayer,
+    ColumnLayer,
+    GeohashLayer,
+    H3HexagonLayer,
+    PathLayer,
+    PointCloudLayer,
+    S2Layer,
+    ScatterplotLayer,
+    SolidPolygonLayer,
+    TripsLayer,
+)
 from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon
+
+# H3HexagonLayer without `h3-py` installed warns on every construction (it
+# only affects lonboard's own auto-view-state computation, not
+# serialization) - fake uint64 cell IDs sidestep the need for it entirely.
+pytestmark = pytest.mark.filterwarnings("ignore::ImportWarning")
 
 
 def _load_module(pkg_dir: Path, name: str):
@@ -324,6 +343,147 @@ def test_serialize_layer_handles_multipoint():
     assert serialized.table.schema.field("geometry").metadata[serialize._EXTENSION_NAME_KEY] == (
         b"geoarrow.multipoint"
     )
+
+
+@pytest.fixture
+def attribute_table():
+    """A GeoArrow-free table, for layer types whose geometry lives entirely
+    in accessor columns (H3/S2/A5/Geohash cell IDs, Arc position pairs)."""
+    return pa.table({"attribute": [1, 2, 3]})
+
+
+def test_serialize_layer_h3_hexagon_ships_uint64_cells(attribute_table):
+    cells = np.array([0x8928308280FFFFF, 0x8928308280FFFFE, 0x8928308280FFFFD], dtype=np.uint64)
+    layer = H3HexagonLayer(table=attribute_table, get_hexagon=cells, get_fill_color=[255, 0, 0])
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.layer_type == "h3-hexagon"
+    assert serialized.table.num_rows == 3
+    assert "geometry" not in serialized.table.schema.names
+    assert serialized.table.schema.field("get_hexagon").type == pa.uint64()
+    assert serialized.props["getHexagon"] == {"@@arrowColumn": "get_hexagon"}
+
+    with pa.ipc.open_stream(serialized.ipc_bytes) as reader:
+        for batch in reader:
+            batch.validate(full=True)
+
+
+def test_serialize_layer_s2_ships_string_tokens(attribute_table):
+    layer = S2Layer(table=attribute_table, get_s2_token=np.array(["89c25c", "89c25d", "89c25e"]))
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.layer_type == "s2"
+    assert serialized.table.schema.field("get_s2_token").type == pa.string()
+    assert serialized.props["getS2Token"] == {"@@arrowColumn": "get_s2_token"}
+
+
+def test_serialize_layer_a5_ships_uint64_pentagons(attribute_table):
+    layer = A5Layer(table=attribute_table, get_pentagon=np.array([1, 2, 3], dtype=np.uint64))
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.layer_type == "a5"
+    assert serialized.table.schema.field("get_pentagon").type == pa.uint64()
+
+
+def test_serialize_layer_geohash_ships_string_hashes(attribute_table):
+    layer = GeohashLayer(table=attribute_table, get_geohash=np.array(["u4pruy", "u4pruz", "u4prv0"]))
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.layer_type == "geohash"
+    assert serialized.table.schema.field("get_geohash").type == pa.string()
+
+
+def test_serialize_layer_rejects_scalar_required_accessor(attribute_table):
+    """`S2Layer(get_s2_token="89c25c")` is valid lonboard - it broadcasts one
+    string to every row via `TextAccessor`. But a scalar can't carry per-row
+    geometry, and `build_layer_props` would ship it as a plain JSON prop
+    (not an Arrow column), which the frontend can't render. This must raise
+    before it gets that far."""
+    layer = S2Layer(table=attribute_table, get_s2_token="89c25c")
+
+    with pytest.raises(ValueError, match="must be set to an array"):
+        serialize.serialize_layer(layer, "layer-0")
+
+
+def test_serialize_layer_arc_ships_position_pairs(attribute_table):
+    layer = ArcLayer(
+        table=attribute_table,
+        get_source_position=np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]),
+        get_target_position=np.array([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]),
+    )
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.layer_type == "arc"
+    assert serialized.table.num_rows == 3
+    xy_pair_type = pa.list_(pa.field("xy", pa.float64()), 2)
+    assert serialized.table.schema.field("get_source_position").type == xy_pair_type
+    assert serialized.table.schema.field("get_target_position").type == xy_pair_type
+
+
+def test_serialize_layer_column_keeps_geometry_column():
+    gdf = gpd.GeoDataFrame(geometry=[Point(0, 0), Point(1, 1), Point(2, 2)], crs="EPSG:4326")
+    layer = ColumnLayer.from_geopandas(gdf, get_fill_color=[255, 0, 0])
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.layer_type == "column"
+    assert "geometry" in serialized.table.schema.names
+
+
+def test_serialize_layer_point_cloud_keeps_3d_geometry_column():
+    gdf = gpd.GeoDataFrame(
+        geometry=gpd.GeoSeries.from_xy([0, 1, 2], [0, 1, 2], [0, 1, 2]), crs="EPSG:4326"
+    )
+    layer = PointCloudLayer.from_geopandas(gdf, get_color=[255, 0, 0])
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.layer_type == "point-cloud"
+    assert "geometry" in serialized.table.schema.names
+
+
+def test_serialize_layer_trip_rescales_timestamps_to_float32():
+    """deck.gl uploads trip timestamps as a float32 vertex attribute, so raw
+    microsecond epoch values (which need 64 bits) must be shifted into
+    float32's exact-integer range first - see `_rescale_trip_timestamps`."""
+    gdf = gpd.GeoDataFrame(
+        geometry=[LineString([(0, 0), (1, 1)]), LineString([(2, 2), (3, 3)])], crs="EPSG:4326"
+    )
+    timestamps = pa.array(
+        [
+            [datetime.datetime(2024, 1, 1, 0, 0, 0), datetime.datetime(2024, 1, 1, 0, 0, 10)],
+            [datetime.datetime(2024, 1, 1, 0, 0, 5), datetime.datetime(2024, 1, 1, 0, 0, 15)],
+        ]
+    )
+    layer = TripsLayer.from_geopandas(gdf, get_timestamps=timestamps)
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.table.schema.field("get_timestamps").type == pa.list_(pa.float32())
+    flattened = [v for row in serialized.table.column("get_timestamps").to_pylist() for v in row]
+    assert min(flattened) == serialize._TRIP_TIMESTAMP_OFFSET_BASE
+    assert serialized.props["currentTime"] == 0.0  # not "CurrentTime" (leading-underscore trait)
+
+
+def test_serialize_layer_still_rejects_geometry_required_layer_with_no_geometry_column(monkeypatch):
+    """Scatterplot/Path/Polygon/... must still fail loudly with no GeoArrow
+    geometry column - only the accessor-geometry layer types (H3/S2/A5/
+    Geohash/Arc) are exempt from this check. Lonboard's own trait validation
+    prevents constructing a real PathLayer with no geometry column, so this
+    patches `_geometry_column_names` to simulate the empty-schema case."""
+    layer = PathLayer.from_geopandas(
+        gpd.GeoDataFrame(geometry=[LineString([(0, 0), (1, 1)])], crs="EPSG:4326"),
+        get_color=[0, 0, 0],
+    )
+    monkeypatch.setattr(serialize, "_geometry_column_names", lambda schema: [])
+
+    with pytest.raises(ValueError, match="no GeoArrow-encoded geometry column"):
+        serialize.serialize_layer(layer, "layer-0")
 
 
 def test_pack_payload_rejects_non_finite_numbers(points_gdf):

@@ -11,7 +11,13 @@ from lonboard import Map
 from lonboard.basemap import CartoStyle
 
 from ._perf import perf_enabled, span
-from .serialize import Compression, check_payload_size, pack_payload, serialize_layer_cached
+from .serialize import (
+    ACCESSOR_GEOMETRY_LAYER_TYPES,
+    Compression,
+    check_payload_size,
+    pack_payload,
+    serialize_layer_cached,
+)
 
 # Fully-qualified name = "<project name from pyproject.toml>.<[tool.streamlit.component] entry>".
 _COMPONENT_NAME = "streamlit-lonboard.lonboard_map"
@@ -67,6 +73,13 @@ def st_lonboard(
     more than once with byte-identical arguments in the same script run —
     same as any other Streamlit element.
 
+    H3/S2/A5/Geohash/Arc layers carry their geometry in accessor columns
+    (cell IDs, point pairs) rather than a bounding geometry column, so
+    lonboard cannot compute a default view state for them (H3 can, but only
+    if `h3-py` is installed). Pass an explicit `view_state=` when using these
+    layer types, or a degenerate `{0, 0, 0}` view will be used and a warning
+    shown.
+
     `compression` controls gzip compression of the Arrow payload:
     - `"auto"` (default): compress only above
       `serialize.AUTO_COMPRESSION_THRESHOLD` (1MB) of raw data. Worth it for
@@ -85,6 +98,20 @@ def st_lonboard(
 
         if view_state is None:
             view_state = _view_state_to_dict(map.view_state)
+            if (
+                view_state["longitude"] == 0
+                and view_state["latitude"] == 0
+                and view_state["zoom"] == 0
+                and any(
+                    layer._layer_type in ACCESSOR_GEOMETRY_LAYER_TYPES for layer in map.layers
+                )
+            ):
+                st.warning(
+                    "st_lonboard: couldn't compute a default view state (H3/S2/A5/"
+                    "Geohash/Arc layers store geometry in accessor columns, not a "
+                    "bounding geometry column - H3 needs `h3-py` installed for "
+                    "auto-centering). Pass an explicit `view_state=` to `st_lonboard()`."
+                )
         if basemap_style == CartoStyle.PositronNoLabels and map.basemap is not None:
             basemap_style = str(map.basemap.style)
 
