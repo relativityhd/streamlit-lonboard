@@ -7,6 +7,7 @@
  */
 
 import { tableFromIPC, type Table } from "apache-arrow";
+import type { ExtensionHeader } from "./extensions";
 import { fnv1a, fnv1aString } from "./fingerprint";
 
 // Bump in lockstep with streamlit_lonboard.serialize.PAYLOAD_FORMAT_VERSION.
@@ -16,6 +17,8 @@ export interface LayerHeader {
   id: string;
   type: string;
   props: Record<string, unknown>;
+  /** Layer extensions attached to this lonboard layer, e.g. `PathStyleExtension`. Omitted when none. */
+  extensions?: ExtensionHeader[];
   byteOffset: number;
   byteLength: number;
 }
@@ -57,12 +60,12 @@ export interface ContainerHeader {
  *   benchmarks/RESULTS.md - is skipped entirely, and `table` is omitted here;
  *   the caller must reuse its previously-parsed table.
  * - `headerFingerprint` covers everything else that affects rendering (JSON
- *   props - anything NOT `id`/`type`/byte range, since byte offsets shift
- *   whenever an earlier layer's size changes even though this layer's own
- *   content didn't). It is always computed, independently of whether the
- *   bytes changed, so a rerun that only flips a prop (e.g. a slider-driven
- *   `filter_range` or `opacity`) is still detected even when the geometry
- *   bytes are byte-identical.
+ *   props, extensions - anything NOT `id`/`type`/byte range, since byte
+ *   offsets shift whenever an earlier layer's size changes even though this
+ *   layer's own content didn't). It is always computed, independently of
+ *   whether the bytes changed, so a rerun that only flips a prop (e.g. a
+ *   slider-driven `filter_range` or `opacity`) is still detected even when
+ *   the geometry bytes are byte-identical.
  *
  * `table` is therefore present whenever the bytes changed (freshly parsed
  * here) and absent only when they didn't. Callers reconstruct deck.gl layers
@@ -109,7 +112,7 @@ async function decompressGzip(bytes: Uint8Array): Promise<Uint8Array> {
  * size changes and carry no rendering information of their own).
  */
 function headerFingerprintPayload(layerHeader: LayerHeader): unknown {
-  return { props: layerHeader.props };
+  return { props: layerHeader.props, extensions: layerHeader.extensions };
 }
 
 /**

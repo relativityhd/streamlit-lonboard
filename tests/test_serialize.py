@@ -29,6 +29,12 @@ from lonboard import (
     SolidPolygonLayer,
     TripsLayer,
 )
+from lonboard.layer_extension import (
+    BrushingExtension,
+    CollisionFilterExtension,
+    DataFilterExtension,
+    PathStyleExtension,
+)
 from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon
 
 # H3HexagonLayer without `h3-py` installed warns on every construction (it
@@ -301,9 +307,7 @@ def test_serialize_layer_produces_valid_ipc_for_multi_chunk_polygon_layer():
         return Polygon([(x, 0), (x + 0.5, 0), (x + 0.5, 0.5), (x, 0.5)])
 
     gdf = gpd.GeoDataFrame(geometry=[MultiPolygon([sq(i)]) for i in range(6)], crs="EPSG:4326")
-    layer = SolidPolygonLayer.from_geopandas(
-        gdf, get_fill_color=np.full((6, 4), 128, dtype="uint8"), _rows_per_chunk=2
-    )
+    layer = SolidPolygonLayer.from_geopandas(gdf, get_fill_color=np.full((6, 4), 128, dtype="uint8"), _rows_per_chunk=2)
     assert pa.table(layer.table).column("geometry").num_chunks > 1  # precondition: the bug needs >1 chunk
 
     serialized = serialize.serialize_layer(layer, "layer-0")
@@ -340,9 +344,7 @@ def test_serialize_layer_handles_multipoint():
     serialized = serialize.serialize_layer(layer, "layer-0")
 
     assert serialized.table.num_rows == 2
-    assert serialized.table.schema.field("geometry").metadata[serialize._EXTENSION_NAME_KEY] == (
-        b"geoarrow.multipoint"
-    )
+    assert serialized.table.schema.field("geometry").metadata[serialize._EXTENSION_NAME_KEY] == (b"geoarrow.multipoint")
 
 
 @pytest.fixture
@@ -436,9 +438,7 @@ def test_serialize_layer_column_keeps_geometry_column():
 
 
 def test_serialize_layer_point_cloud_keeps_3d_geometry_column():
-    gdf = gpd.GeoDataFrame(
-        geometry=gpd.GeoSeries.from_xy([0, 1, 2], [0, 1, 2], [0, 1, 2]), crs="EPSG:4326"
-    )
+    gdf = gpd.GeoDataFrame(geometry=gpd.GeoSeries.from_xy([0, 1, 2], [0, 1, 2], [0, 1, 2]), crs="EPSG:4326")
     layer = PointCloudLayer.from_geopandas(gdf, get_color=[255, 0, 0])
 
     serialized = serialize.serialize_layer(layer, "layer-0")
@@ -451,9 +451,7 @@ def test_serialize_layer_trip_rescales_timestamps_to_float32():
     """deck.gl uploads trip timestamps as a float32 vertex attribute, so raw
     microsecond epoch values (which need 64 bits) must be shifted into
     float32's exact-integer range first - see `_rescale_trip_timestamps`."""
-    gdf = gpd.GeoDataFrame(
-        geometry=[LineString([(0, 0), (1, 1)]), LineString([(2, 2), (3, 3)])], crs="EPSG:4326"
-    )
+    gdf = gpd.GeoDataFrame(geometry=[LineString([(0, 0), (1, 1)]), LineString([(2, 2), (3, 3)])], crs="EPSG:4326")
     timestamps = pa.array(
         [
             [datetime.datetime(2024, 1, 1, 0, 0, 0), datetime.datetime(2024, 1, 1, 0, 0, 10)],
@@ -503,3 +501,190 @@ def test_pack_payload_rejects_non_finite_numbers(points_gdf):
             view_state={"longitude": float("nan"), "latitude": 1.0, "zoom": 7},
             map_options={},
         )
+
+
+@pytest.fixture
+def path_gdf():
+    return gpd.GeoDataFrame(
+        geometry=[LineString([(0, 0), (1, 1)]), LineString([(1, 0), (0, 1)])],
+        crs="EPSG:4326",
+    )
+
+
+def test_serialize_extensions_empty_when_none_attached(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+
+    assert serialize.serialize_extensions(layer) == []
+
+
+def test_serialize_extensions_path_style(path_gdf):
+    """`dash`/`high_precision_dash`/`offset` live on the extension object and
+    are the only things `serialize_extensions` needs to handle - the layer
+    props an extension injects (`get_dash_array`, `dash_justified`, ...) are
+    ordinary layer traits by the time lonboard's `BaseLayer.__init__` returns
+    (see `lonboard/layer/_base.py` `_add_extension_traits`), so
+    `build_layer_props` already ships them with no changes needed."""
+    ext = PathStyleExtension(dash=True, high_precision_dash=False)
+    layer = PathLayer.from_geopandas(path_gdf, extensions=[ext], get_dash_array=[4, 2], dash_justified=True)
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.extensions == [{"type": "path-style", "props": {"dash": True, "highPrecisionDash": False}}]
+    # `offset` was never set (stays `None`) - correctly omitted, not shipped as null.
+    assert "offset" not in serialized.extensions[0]["props"]
+    assert serialized.props["getDashArray"] == [4, 2]
+    assert serialized.props["dashJustified"] is True
+
+
+def test_serialize_extensions_path_style_array_dash(path_gdf):
+    """`get_dash_array` also accepts a per-row Arrow array (not just a
+    constant [dash, gap] pair) - it's a `get_`-prefixed accessor trait like
+    any other, so it goes through `build_layer_props`'s existing arrow-vs-json
+    branch unmodified."""
+    ext = PathStyleExtension(dash=True)
+    dash_arrays = np.array([[4, 2], [1, 1]], dtype="float32")
+    layer = PathLayer.from_geopandas(path_gdf, extensions=[ext], get_dash_array=dash_arrays)
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.props["getDashArray"] == {"@@arrowColumn": "get_dash_array"}
+    assert serialized.table.schema.field("get_dash_array").type == pa.list_(pa.field("", pa.float32()), 2)
+
+
+def test_serialize_extensions_data_filter_ctor_args_and_layer_props(points_gdf):
+    """`filter_size`/`category_size` are shader-compile-time constructor
+    options on the extension; everything else (`filter_range`,
+    `get_filter_value`, ...) is a layer prop, already handled generically."""
+    ext = DataFilterExtension(filter_size=2, category_size=1)
+    layer = ScatterplotLayer.from_geopandas(
+        points_gdf,
+        extensions=[ext],
+        get_filter_value=np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]),
+        filter_range=[(0, 5), (0, 50)],
+    )
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.extensions == [{"type": "data-filter", "props": {"filterSize": 2, "categorySize": 1}}]
+    assert serialized.props["filterRange"] == ((0.0, 5.0), (0.0, 50.0))
+    assert serialized.props["getFilterValue"] == {"@@arrowColumn": "get_filter_value"}
+    assert serialized.table.schema.field("get_filter_value").type == pa.list_(pa.field("", pa.float32()), 2)
+
+
+def test_serialize_extensions_data_filter_scalar_value(points_gdf):
+    """filter_size defaults to 1, so a plain scalar `get_filter_value` (one
+    number for the whole layer, not one per row) is valid lonboard usage and
+    should ship as a JSON number, not an Arrow column."""
+    ext = DataFilterExtension()
+    layer = ScatterplotLayer.from_geopandas(points_gdf, extensions=[ext], get_filter_value=2.5, filter_range=(0, 5))
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.extensions == [{"type": "data-filter", "props": {"filterSize": 1}}]
+    assert serialized.props["getFilterValue"] == 2.5
+
+
+def test_serialize_extensions_brushing_keeps_geometry_column_first(points_gdf):
+    """`get_brushing_target` uses `PointAccessor`, the same trait type used
+    for real geometry columns - regression test locking that the real
+    geometry column is always selected into the output table *before*
+    accessor columns are appended (`serialize_layer`: `table.select(...)`
+    happens before the `append_column` loop), so a geoarrow-aware reader
+    scanning fields in order always finds the real geometry first."""
+    ext = BrushingExtension()
+    layer = ScatterplotLayer.from_geopandas(
+        points_gdf,
+        extensions=[ext],
+        get_brushing_target=np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]),
+        brushing_target="custom",
+        brushing_radius=5000,
+    )
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.extensions == [{"type": "brushing", "props": {}}]
+    assert serialized.table.schema.names[0] == "geometry"
+    assert "get_brushing_target" in serialized.table.schema.names
+    assert serialized.props["brushingTarget"] == "custom"
+    assert serialized.props["brushingRadius"] == 5000.0
+    assert serialized.props["getBrushingTarget"] == {"@@arrowColumn": "get_brushing_target"}
+
+
+def test_serialize_extensions_collision_filter(points_gdf):
+    """`CollisionFilterExtension` has no config traits of its own - everything
+    (`collision_group`, `get_collision_priority`) is a layer prop."""
+    ext = CollisionFilterExtension()
+    layer = ScatterplotLayer.from_geopandas(
+        points_gdf,
+        extensions=[ext],
+        get_collision_priority=np.array([1.0, 2.0, 3.0]),
+        collision_group="group-a",
+    )
+
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    assert serialized.extensions == [{"type": "collision-filter", "props": {}}]
+    assert serialized.props["collisionGroup"] == "group-a"
+    assert serialized.props["getCollisionPriority"] == {"@@arrowColumn": "get_collision_priority"}
+
+
+def test_serialize_extensions_rejects_unknown_type(points_gdf):
+    # A real extension with its `_extension_type` overridden after construction
+    # (rather than a fake object) - `layer.extensions` is itself a traitlets
+    # `Instance(BaseExtension)` trait, so a non-BaseExtension object would fail
+    # lonboard's *own* validation before ever reaching `serialize_extensions`.
+    ext = BrushingExtension()
+    ext._extension_type = "clip"
+    layer = ScatterplotLayer.from_geopandas(points_gdf, extensions=[ext])
+
+    with pytest.raises(ValueError, match="does not yet support the 'clip' layer extension"):
+        serialize.serialize_extensions(layer)
+
+
+def test_pack_payload_omits_extensions_key_when_none_attached(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression=None)
+
+    header, _ = _unpack(blob)
+    assert "extensions" not in header["layers"][0]
+
+
+def test_pack_payload_includes_extensions_key_when_present(path_gdf):
+    ext = PathStyleExtension(dash=True)
+    layer = PathLayer.from_geopandas(path_gdf, extensions=[ext], get_dash_array=[4, 2])
+    serialized = serialize.serialize_layer(layer, "layer-0")
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression=None)
+
+    header, _ = _unpack(blob)
+    assert header["layers"][0]["extensions"] == [{"type": "path-style", "props": {"dash": True}}]
+
+
+def test_serialize_layer_cached_invalidates_on_extension_trait_change(path_gdf):
+    ext = PathStyleExtension(dash=True)
+    layer = PathLayer.from_geopandas(path_gdf, extensions=[ext], get_dash_array=[4, 2])
+
+    first = serialize.serialize_layer_cached(layer, "layer-0")
+    ext.dash = False
+    second = serialize.serialize_layer_cached(layer, "layer-0")
+
+    assert first is not second
+    assert first.extensions[0]["props"]["dash"] is True
+    assert second.extensions[0]["props"]["dash"] is False
+
+
+def test_serialize_layer_cached_hits_when_extension_untouched(path_gdf):
+    """A cache hit shouldn't re-attach a second observer to the same
+    extension object on every call (that would mean N duplicate eviction
+    callbacks after N cache hits) - not directly observable from the public
+    API, so this just pins down that repeated calls keep hitting the cache
+    once an extension is already being observed."""
+    ext = PathStyleExtension(dash=True)
+    layer = PathLayer.from_geopandas(path_gdf, extensions=[ext], get_dash_array=[4, 2])
+
+    first = serialize.serialize_layer_cached(layer, "layer-0")
+    for _ in range(3):
+        assert serialize.serialize_layer_cached(layer, "layer-0") is first
+

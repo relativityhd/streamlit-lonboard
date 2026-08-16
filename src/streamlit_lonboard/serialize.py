@@ -24,7 +24,7 @@ import json
 import struct
 from dataclasses import dataclass
 from typing import Any, Literal
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakSet
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -84,6 +84,11 @@ _REQUIRED_ACCESSORS: dict[str, tuple[str, ...]] = {
     "arc": ("get_source_position", "get_target_position"),
 }
 
+# lonboard `BaseExtension._extension_type` values this frontend knows how to
+# instantiate (see frontend/src/extensions.ts). The wire "type" IS the
+# extension_type string - no renaming table needed, unlike layers.
+SUPPORTED_EXTENSION_TYPES = {"brushing", "collision-filter", "data-filter", "path-style"}
+
 # deck.gl prop names that don't follow the generic snake_case -> camelCase
 # rule (see `_snake_to_camel`) - e.g. a leading underscore trait.
 _PROP_NAME_OVERRIDES = {"_current_time": "currentTime"}
@@ -96,14 +101,16 @@ _PROP_NAME_OVERRIDES = {"_current_time": "currentTime"}
 # represent exactly as an integer.
 _TRIP_TIMESTAMP_OFFSET_BASE = -16777216
 
-# Traits that are never forwarded as props (internal/comm/ipywidgets plumbing).
+# Traits that are never forwarded as generic props (internal/comm/ipywidgets
+# plumbing, or - like `extensions` - handled by their own dedicated
+# serialization path instead of the generic one below).
 _IGNORED_TRAITS = {
     "table",
     "_layer_type",
     "comm",
     "log",
     "keys",
-    "extensions",
+    "extensions",  # see `serialize_extensions`
     "before_id",
     "selected_index",
     "_model_module",
@@ -158,6 +165,7 @@ class SerializedLayer:
     layer_id: str
     layer_type: str
     props: dict[str, Any]
+    extensions: list[dict[str, Any]]
     table: pa.Table
     ipc_bytes: bytes
 
@@ -186,6 +194,50 @@ def build_layer_props(layer: Any) -> tuple[dict[str, Any], dict[str, pa.ChunkedA
             props[prop_name] = value
 
     return props, accessor_columns
+
+
+def serialize_extensions(layer: Any) -> list[dict[str, Any]]:
+    """Serialize a layer's `extensions` tuple into wire-format extension headers.
+
+    Each entry is `{"type": <lonboard _extension_type>, "props": {...}}`, where
+    `props` holds only the extension object's *own* config traits (e.g.
+    `PathStyleExtension.dash`, `DataFilterExtension.filter_size`), camelCased
+    like any other prop.
+
+    This deliberately does *not* handle the layer-side traits an extension
+    injects (e.g. `get_dash_array`, `filter_range`) - by the time
+    `BaseLayer.__init__` returns, those are ordinary traits *on the layer*
+    (lonboard's `_add_extension_traits` calls `HasTraits.add_traits(self,
+    **extension._layer_traits)`), so `build_layer_props()` already picks them
+    up with no changes needed here.
+    """
+    extensions: list[dict[str, Any]] = []
+    for ext in getattr(layer, "extensions", ()) or ():
+        extension_type = ext._extension_type
+        if extension_type not in SUPPORTED_EXTENSION_TYPES:
+            raise ValueError(
+                f"streamlit-lonboard does not yet support the {extension_type!r} layer "
+                f"extension. Supported extensions: {sorted(SUPPORTED_EXTENSION_TYPES)}"
+            )
+
+        # `_layer_traits` names never actually appear in `ext.trait_names()`
+        # (they're injected onto the *layer*, not the extension) - excluded
+        # here anyway as a defensive mirror of lonboard's own layer/extension
+        # trait split, in case a future lonboard version changes that.
+        own_trait_names = set(ext.trait_names()) - _IGNORED_TRAITS - {"_extension_type"}
+        own_trait_names -= set(type(ext)._layer_traits)
+
+        props: dict[str, Any] = {}
+        for name in sorted(own_trait_names):
+            value = getattr(ext, name, None)
+            if value is None:
+                continue
+            if _is_json_safe(value):
+                props[_PROP_NAME_OVERRIDES.get(name) or _snake_to_camel(name)] = value
+
+        extensions.append({"type": extension_type, "props": props})
+
+    return extensions
 
 
 def _canonicalize_table(table: pa.Table) -> pa.Table:
@@ -271,6 +323,7 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
 
         table = pa.table(layer.table)
         props, accessor_columns = build_layer_props(layer)
+        extensions = serialize_extensions(layer)
 
         keep_columns = _geometry_column_names(table.schema)
         if not keep_columns and layer._layer_type not in ACCESSOR_GEOMETRY_LAYER_TYPES:
@@ -285,9 +338,7 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
                 )
 
         if layer._layer_type == "trip" and "get_timestamps" in accessor_columns:
-            accessor_columns["get_timestamps"] = _rescale_trip_timestamps(
-                accessor_columns["get_timestamps"]
-            )
+            accessor_columns["get_timestamps"] = _rescale_trip_timestamps(accessor_columns["get_timestamps"])
 
         out_table = table.select(keep_columns)
         for name, chunked in accessor_columns.items():
@@ -299,6 +350,7 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
             layer_id=layer_id,
             layer_type=layer_type,
             props=props,
+            extensions=extensions,
             table=out_table,
             ipc_bytes=ipc_bytes,
         )
@@ -314,10 +366,25 @@ _layer_cache: "WeakKeyDictionary[Any, SerializedLayer]" = WeakKeyDictionary()
 # Tracks which layer objects already have our invalidation observer attached,
 # so we don't re-attach it (and re-evict) on every cache hit.
 _observed_layers: "WeakKeyDictionary[Any, None]" = WeakKeyDictionary()
+# Same, but for extension objects (`ext.dash = False` etc. must also evict
+# the owning layer's cache entry - the layer-level observer above only fires
+# for traits *on the layer itself*, not on a separate extension object it
+# merely references).
+_observed_extensions: "WeakKeyDictionary[Any, None]" = WeakKeyDictionary()
+# Which layer(s) currently reference a given extension object, so its
+# trait-change observer knows which cache entries to evict. A `WeakSet` of
+# layers (not a plain set) so this mapping doesn't itself keep layers alive -
+# an extension is, in principle, shareable across more than one layer.
+_extension_owners: "WeakKeyDictionary[Any, WeakSet]" = WeakKeyDictionary()
 
 
 def _evict_cache_on_trait_change(change: dict[str, Any]) -> None:
     _layer_cache.pop(change["owner"], None)
+
+
+def _evict_cache_for_extension_trait_change(change: dict[str, Any]) -> None:
+    for layer in _extension_owners.get(change["owner"], ()):
+        _layer_cache.pop(layer, None)
 
 
 def serialize_layer_cached(layer: Any, layer_id: str) -> SerializedLayer:
@@ -325,8 +392,9 @@ def serialize_layer_cached(layer: Any, layer_id: str) -> SerializedLayer:
 
     A cache hit skips table-building *and* the Arrow IPC write entirely.
     Invalidated automatically if any trait on the layer changes (lonboard
-    layers are traitlets `HasTraits` instances), or if the same object is
-    reused at a different `layer_id` (e.g. the app reordered its layers list).
+    layers are traitlets `HasTraits` instances), if any trait on one of its
+    `extensions` changes, or if the same object is reused at a different
+    `layer_id` (e.g. the app reordered its layers list).
     """
     cached = _layer_cache.get(layer)
     if cached is not None and cached.layer_id == layer_id:
@@ -338,6 +406,14 @@ def serialize_layer_cached(layer: Any, layer_id: str) -> SerializedLayer:
     if layer not in _observed_layers:
         layer.observe(_evict_cache_on_trait_change, names=traitlets.All)
         _observed_layers[layer] = None
+
+    for ext in getattr(layer, "extensions", ()) or ():
+        owners = _extension_owners.setdefault(ext, WeakSet())
+        owners.add(layer)
+        if ext not in _observed_extensions:
+            ext.observe(_evict_cache_for_extension_trait_change, names=traitlets.All)
+            _observed_extensions[ext] = None
+
     return serialized
 
 
@@ -355,9 +431,7 @@ def _compress_body(body: bytes, compression: Compression) -> tuple[bytes, str | 
             return body, None
         compression = "gzip"
     if compression != "gzip":
-        raise ValueError(
-            f"st_lonboard: compression={compression!r} is not supported; use 'auto', 'gzip', or None"
-        )
+        raise ValueError(f"st_lonboard: compression={compression!r} is not supported; use 'auto', 'gzip', or None")
 
     with span("pack_payload.compress"):
         compressed = gzip.compress(body, compresslevel=6)
@@ -386,15 +460,16 @@ def pack_payload(
         layer_headers = []
         for layer in serialized_layers:
             ipc_bytes = layer.ipc_bytes
-            layer_headers.append(
-                {
-                    "id": layer.layer_id,
-                    "type": layer.layer_type,
-                    "props": layer.props,
-                    "byteOffset": body.tell(),
-                    "byteLength": len(ipc_bytes),
-                }
-            )
+            layer_header = {
+                "id": layer.layer_id,
+                "type": layer.layer_type,
+                "props": layer.props,
+                "byteOffset": body.tell(),
+                "byteLength": len(ipc_bytes),
+            }
+            if layer.extensions:
+                layer_header["extensions"] = layer.extensions
+            layer_headers.append(layer_header)
             body.write(ipc_bytes)
 
         raw_body = body.getvalue()

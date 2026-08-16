@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer types (lonboard has no auto-viewport for S2/A5/Geohash/Arc, and H3
   auto-centering needs `h3-py` installed) - pass an explicit `view_state=`.
 - New `examples/dggs_app.py` demonstrating H3 and Arc layers.
+- Support for lonboard's layer extensions: `PathStyleExtension` (dashed/offset
+  paths), `DataFilterExtension` (GPU-side numeric/category filtering - pairs
+  well with `st.slider` driving `layer.filter_range`), `BrushingExtension`, and
+  `CollisionFilterExtension`. The layer-side props an extension injects (e.g.
+  `get_dash_array`, `filter_range`) already shipped before this change; what
+  was missing was instantiating the extension itself on the frontend, which is
+  what actually activates deck.gl's shader-level behavior.
 
 ### Fixed
 
