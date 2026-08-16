@@ -101,7 +101,7 @@ def st_lonboard(
     each default to `None`, which means "use the passed `map`'s own value"
     (`lonboard.Map.picking_radius` etc.) - pass an explicit value to override
     it, or omit both a `map` and these to get lonboard's own defaults (5,
-    `None`, `None`, `None` respectively).
+    `None`, `None`, `""` respectively).
 
     `map.controls` (default: a fullscreen button, zoom/compass buttons, and a
     scale bar - lonboard's own default) is always forwarded; there is no
@@ -183,12 +183,14 @@ def st_lonboard(
         }
         # Omitted when left at lonboard's own "unset" default, matching how
         # `extensions` is omitted per-layer when empty (serialize.py) - keeps
-        # the common case's payload minimal.
+        # the common case's payload minimal. `custom_attribution`'s "unset" is
+        # `""` (lonboard.Map.custom_attribution's actual default), not `None`
+        # - a truthiness check catches both that and an explicit `None`.
         if use_device_pixels is not None:
             map_options["useDevicePixels"] = use_device_pixels
         if parameters is not None:
             map_options["parameters"] = parameters
-        if custom_attribution is not None:
+        if custom_attribution:
             map_options["customAttribution"] = custom_attribution
         controls = serialize_controls(map.controls)
         if controls:
