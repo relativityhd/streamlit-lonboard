@@ -7,7 +7,7 @@
  */
 
 import { tableFromIPC, type Table } from "apache-arrow";
-import { fnv1a } from "./fingerprint";
+import { fnv1a, fnv1aString } from "./fingerprint";
 
 // Bump in lockstep with streamlit_lonboard.serialize.PAYLOAD_FORMAT_VERSION.
 const SUPPORTED_PAYLOAD_FORMAT_VERSION = 1;
@@ -48,25 +48,33 @@ export interface ContainerHeader {
 }
 
 /**
- * A layer whose byte slice's fingerprint matches the last time this same
- * `id` was parsed (per `previousFingerprints`) - `tableFromIPC` was skipped
- * entirely; the caller should reuse whatever it built from the previous
- * parse (see `index.ts`'s per-layer deck.gl layer cache).
+ * A parsed layer carries two independent fingerprints, because the two
+ * halves of a lonboard layer change at very different costs:
+ *
+ * - `bytesFingerprint` covers the Arrow IPC bytes (geometry + accessor
+ *   columns). When it matches the last parse (per `previousBytesFingerprints`),
+ *   `tableFromIPC` - the dominant per-rerun cost at scale, see
+ *   benchmarks/RESULTS.md - is skipped entirely, and `table` is omitted here;
+ *   the caller must reuse its previously-parsed table.
+ * - `headerFingerprint` covers everything else that affects rendering (JSON
+ *   props - anything NOT `id`/`type`/byte range, since byte offsets shift
+ *   whenever an earlier layer's size changes even though this layer's own
+ *   content didn't). It is always computed, independently of whether the
+ *   bytes changed, so a rerun that only flips a prop (e.g. a slider-driven
+ *   `filter_range` or `opacity`) is still detected even when the geometry
+ *   bytes are byte-identical.
+ *
+ * `table` is therefore present whenever the bytes changed (freshly parsed
+ * here) and absent only when they didn't. Callers reconstruct deck.gl layers
+ * whenever *either* fingerprint changed since the last build, reusing the
+ * previous table when only the header changed.
  */
-export interface UnchangedLayer {
-  status: "unchanged";
+export interface ParsedLayer {
   header: LayerHeader;
-  fingerprint: string;
+  bytesFingerprint: string;
+  headerFingerprint: string;
+  table?: Table;
 }
-
-export interface ChangedLayer {
-  status: "changed";
-  header: LayerHeader;
-  fingerprint: string;
-  table: Table;
-}
-
-export type ParsedLayer = UnchangedLayer | ChangedLayer;
 
 export interface ParsedContainer {
   header: ContainerHeader;
@@ -95,15 +103,27 @@ async function decompressGzip(bytes: Uint8Array): Promise<Uint8Array> {
 }
 
 /**
- * `previousFingerprints` (layer id -> fingerprint from the last call) lets
- * this skip `tableFromIPC` for byte-identical layers, not just deck.gl layer
- * construction - `tableFromIPC` is the dominant per-rerun frontend cost at
- * scale (see benchmarks/RESULTS.md), so skipping the parse matters far more
- * than skipping layer construction alone.
+ * The subset of a `LayerHeader` that should trigger a deck.gl layer rebuild
+ * when it changes - i.e. everything except identity (`id`, `type`) and byte
+ * range (`byteOffset`/`byteLength`, which shift whenever an earlier layer's
+ * size changes and carry no rendering information of their own).
+ */
+function headerFingerprintPayload(layerHeader: LayerHeader): unknown {
+  return { props: layerHeader.props };
+}
+
+/**
+ * `previousBytesFingerprints` (layer id -> bytes fingerprint from the last
+ * call) lets this skip `tableFromIPC` for byte-identical layers, not just
+ * deck.gl layer construction - `tableFromIPC` is the dominant per-rerun
+ * frontend cost at scale (see benchmarks/RESULTS.md), so skipping the parse
+ * matters far more than skipping layer construction alone. The (much
+ * cheaper) header fingerprint is always computed, regardless of whether the
+ * bytes matched - see `ParsedLayer`.
  */
 export async function parseContainer(
   bytes: Uint8Array,
-  previousFingerprints: ReadonlyMap<string, string> = new Map(),
+  previousBytesFingerprints: ReadonlyMap<string, string> = new Map(),
 ): Promise<ParsedContainer> {
   performance.mark("st-lonboard:parseContainer:start");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -136,10 +156,11 @@ export async function parseContainer(
       layerHeader.byteOffset,
       layerHeader.byteOffset + layerHeader.byteLength,
     );
-    const fingerprint = fnv1a(ipcBytes);
+    const bytesFingerprint = fnv1a(ipcBytes);
+    const headerFingerprint = fnv1aString(JSON.stringify(headerFingerprintPayload(layerHeader)));
 
-    if (previousFingerprints.get(layerHeader.id) === fingerprint) {
-      return { status: "unchanged", header: layerHeader, fingerprint };
+    if (previousBytesFingerprints.get(layerHeader.id) === bytesFingerprint) {
+      return { header: layerHeader, bytesFingerprint, headerFingerprint };
     }
 
     performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:start`);
@@ -150,7 +171,7 @@ export async function parseContainer(
       `st-lonboard:tableFromIPC[${layerHeader.id}]:start`,
       `st-lonboard:tableFromIPC[${layerHeader.id}]:end`,
     );
-    return { status: "changed", header: layerHeader, fingerprint, table };
+    return { header: layerHeader, bytesFingerprint, headerFingerprint, table };
   });
 
   performance.mark("st-lonboard:parseContainer:end");

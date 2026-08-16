@@ -12,6 +12,7 @@
 
 import type { Layer, PickingInfo } from "@deck.gl/core";
 import { MapboxOverlay } from "@deck.gl/mapbox";
+import type { Table } from "apache-arrow";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { type ContainerHeader, type MapOptions, parseContainer } from "./container";
@@ -28,15 +29,23 @@ interface ComponentApi {
 
 /**
  * What a `buildDeckLayers` call produced for one lonboard layer, kept around
- * so an unchanged rerun (fingerprint match, see container.ts) can be
- * answered without re-parsing or reconstructing anything - see Phase 4b in
- * IMPLEMENTATION_PLAN.md. Note the common "nothing at all changed" case
- * already costs ~0 without this (CCv2 skips calling `mount()` entirely then,
- * confirmed in Phase 4.0) - this cache only matters when *some* layers
- * changed and others didn't within a single `mount()` invocation.
+ * so a rerun where nothing changed (both fingerprints match, see
+ * container.ts) can be answered without re-parsing or reconstructing
+ * anything - see Phase 4b in IMPLEMENTATION_PLAN.md. Note the common
+ * "nothing at all changed" case already costs ~0 without this (CCv2 skips
+ * calling `mount()` entirely then, confirmed in Phase 4.0) - this cache only
+ * matters when *some* layers changed and others didn't within a single
+ * `mount()` invocation.
+ *
+ * `table` is retained (not just the built `deckLayers`) so that a rerun
+ * where only `headerFingerprint` changed - e.g. a slider-driven prop, with
+ * the Arrow bytes byte-identical - can rebuild deck.gl layers from the
+ * already-parsed table instead of needing `tableFromIPC` again.
  */
 interface LayerCacheEntry {
-  fingerprint: string;
+  bytesFingerprint: string;
+  headerFingerprint: string;
+  table: Table;
   deckLayers: Layer[];
   subLayerEntries: [string, SubLayerInfo][];
 }
@@ -176,10 +185,10 @@ export default async function mount(component: ComponentApi): Promise<() => void
   // parseContainer can skip tableFromIPC for layers whose bytes haven't
   // changed since last time (see container.ts).
   const existingState = component.parentElement[MOUNT_KEY] as MountState | undefined;
-  const previousFingerprints = new Map<string, string>();
+  const previousBytesFingerprints = new Map<string, string>();
   if (existingState) {
     for (const [layerId, entry] of existingState.layerCache) {
-      previousFingerprints.set(layerId, entry.fingerprint);
+      previousBytesFingerprints.set(layerId, entry.bytesFingerprint);
     }
   }
 
@@ -188,7 +197,7 @@ export default async function mount(component: ComponentApi): Promise<() => void
   // browser's native (Promise-based) DecompressionStream before it can be
   // sliced into per-layer Arrow IPC ranges. CCv2 awaits this default export,
   // so an async mount() is supported (confirmed against the bundled runtime).
-  const { header, layers } = await parseContainer(bytes, previousFingerprints);
+  const { header, layers } = await parseContainer(bytes, previousBytesFingerprints);
   const state = existingState ?? createMount(component, header);
   state.mapOptions = header.mapOptions;
 
@@ -197,29 +206,49 @@ export default async function mount(component: ComponentApi): Promise<() => void
   const newLayerCache = new Map<string, LayerCacheEntry>();
 
   for (const parsedLayer of layers) {
-    const { header: layerHeader, fingerprint } = parsedLayer;
+    const { header: layerHeader, bytesFingerprint, headerFingerprint, table: freshTable } = parsedLayer;
+    const cached = state.layerCache.get(layerHeader.id);
 
-    if (parsedLayer.status === "unchanged") {
-      const cached = state.layerCache.get(layerHeader.id);
+    if (freshTable === undefined) {
       if (!cached) {
-        // Can't happen: "unchanged" is only returned when previousFingerprints
-        // (built from state.layerCache just above) already had this id+fingerprint.
+        // Can't happen: parseContainer only omits `table` when
+        // previousBytesFingerprints (built from state.layerCache just above)
+        // already had this id+fingerprint.
         throw new Error(
-          `streamlit-lonboard: internal error - layer ${layerHeader.id} reported unchanged ` +
-            "but has no cached build to reuse",
+          `streamlit-lonboard: internal error - layer ${layerHeader.id} reported unchanged bytes ` +
+            "but has no cached table to reuse",
         );
       }
-      for (const [subId, info] of cached.subLayerEntries) {
-        state.subLayerLookup.set(subId, info);
+      if (cached.headerFingerprint === headerFingerprint) {
+        // Bytes AND props all unchanged - reuse the built deck.gl layers
+        // verbatim, skipping buildDeckLayers entirely.
+        for (const [subId, info] of cached.subLayerEntries) {
+          state.subLayerLookup.set(subId, info);
+        }
+        deckLayers.push(...cached.deckLayers);
+        newLayerCache.set(layerHeader.id, cached);
+        continue;
       }
-      deckLayers.push(...cached.deckLayers);
-      newLayerCache.set(layerHeader.id, cached);
-      continue;
+    }
+
+    // Either the Arrow bytes changed (freshTable is the newly-parsed table)
+    // or only the header (props) changed - reuse the cached table in that
+    // case. Either way we need to rebuild the deck.gl layers, but only a
+    // fresh `tableFromIPC` is the expensive part, and that already happened
+    // (or was skipped) in parseContainer.
+    const table = freshTable ?? cached?.table;
+    if (!table) {
+      // Can't happen: cached is only missing when freshTable is defined (see
+      // the throw above), so this branch always has one or the other.
+      throw new Error(
+        `streamlit-lonboard: internal error - layer ${layerHeader.id} has neither a freshly ` +
+          "parsed nor a cached table",
+      );
     }
 
     let built: Layer[];
     try {
-      built = buildDeckLayers(layerHeader, parsedLayer.table, state.subLayerLookup);
+      built = buildDeckLayers(layerHeader, table, state.subLayerLookup);
     } catch (error) {
       // One bad layer (e.g. a props/data mismatch) shouldn't take down every
       // other layer on the map via the BidiComponent error boundary - log and
@@ -235,7 +264,13 @@ export default async function mount(component: ComponentApi): Promise<() => void
       ([, info]) => info.lonboardLayerId === layerHeader.id,
     );
     deckLayers.push(...built);
-    newLayerCache.set(layerHeader.id, { fingerprint, deckLayers: built, subLayerEntries });
+    newLayerCache.set(layerHeader.id, {
+      bytesFingerprint,
+      headerFingerprint,
+      table,
+      deckLayers: built,
+      subLayerEntries,
+    });
   }
   state.layerCache = newLayerCache;
 

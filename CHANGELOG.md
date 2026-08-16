@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   auto-centering needs `h3-py` installed) - pass an explicit `view_state=`.
 - New `examples/dggs_app.py` demonstrating H3 and Arc layers.
 
+### Fixed
+
+- A rerun that changed only a layer's JSON props (e.g. a slider driving `opacity`
+  or `filter_range`) while its Arrow geometry/accessor bytes stayed identical was
+  silently ignored - the frontend's per-layer cache fingerprinted only the Arrow
+  IPC bytes, so it reused the previous render verbatim, props and all. The cache
+  now fingerprints props separately from the Arrow bytes, so prop-only changes
+  are still picked up while byte-identical layers still skip the expensive
+  `tableFromIPC` parse.
+
 ## [0.1.0] - 2026-07-28
 
 ### Added
