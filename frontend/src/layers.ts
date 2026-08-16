@@ -11,11 +11,19 @@
 
 import type { Layer } from "@deck.gl/core";
 import {
+  GeoArrowA5Layer,
+  GeoArrowArcLayer,
+  GeoArrowColumnLayer,
+  GeoArrowGeohashLayer,
+  GeoArrowH3HexagonLayer,
   GeoArrowHeatmapLayer,
   GeoArrowPathLayer,
+  GeoArrowPointCloudLayer,
   GeoArrowPolygonLayer,
+  GeoArrowS2Layer,
   GeoArrowScatterplotLayer,
   GeoArrowSolidPolygonLayer,
+  GeoArrowTripsLayer,
 } from "@geoarrow/deck.gl-geoarrow";
 import type { RecordBatch, Table } from "apache-arrow";
 import type { LayerHeader } from "./container";
@@ -29,6 +37,14 @@ const LAYER_CLASSES: Record<string, AnyLayerClass> = {
   polygon: GeoArrowPolygonLayer,
   "solid-polygon": GeoArrowSolidPolygonLayer,
   heatmap: GeoArrowHeatmapLayer,
+  "h3-hexagon": GeoArrowH3HexagonLayer,
+  s2: GeoArrowS2Layer,
+  a5: GeoArrowA5Layer,
+  geohash: GeoArrowGeohashLayer,
+  arc: GeoArrowArcLayer,
+  column: GeoArrowColumnLayer,
+  "point-cloud": GeoArrowPointCloudLayer,
+  trip: GeoArrowTripsLayer,
 };
 
 const ARROW_COLUMN_MARKER = "@@arrowColumn";
