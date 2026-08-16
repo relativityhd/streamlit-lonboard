@@ -14,6 +14,7 @@ from ._perf import perf_enabled, span
 from .serialize import (
     ACCESSOR_GEOMETRY_LAYER_TYPES,
     Compression,
+    TooltipSpec,
     check_parameters_json_safe,
     check_payload_size,
     pack_payload,
@@ -62,6 +63,7 @@ def st_lonboard(
     parameters: dict[str, Any] | None = None,
     use_device_pixels: bool | float | None = None,
     custom_attribution: str | list[str] | None = None,
+    tooltip: bool | list[str] = False,
     key: str | None = None,
 ) -> StLonboardResult:
     """Render lonboard layers in Streamlit using Arrow end to end (no GeoJSON).
@@ -110,6 +112,16 @@ def st_lonboard(
 
     `selected_index` / `selected_bounds` (lonboard's own click/box-select
     output traits) aren't forwarded - use `StLonboardResult.clicked` instead.
+
+    `tooltip` controls the hover tooltip: `False` (default) shows none;
+    `True` shows every non-geometry column of each layer's own data (falls
+    back to the passed `map`'s `show_tooltip` when left at `False`); a list of
+    column names shows only those (per layer - a name absent from a
+    particular layer's data is silently skipped, since this one setting
+    applies to every layer passed to this call). Requires `pickable=True` on
+    the layer (lonboard's own default). Shipping `True` on a layer with many
+    attribute columns adds that data to the payload on every rerun - prefer
+    an explicit column list for anything beyond a quick look.
     """
     with span("st_lonboard.total"):
         if map is not None and layers is not None:
@@ -148,9 +160,13 @@ def st_lonboard(
             custom_attribution = map.custom_attribution
         check_parameters_json_safe(parameters)
 
+        if tooltip is False and map.show_tooltip:
+            tooltip = True
+        tooltip_spec: TooltipSpec = tooltip if isinstance(tooltip, bool) else tuple(tooltip)
+
         with span("serialize_layers"):
             serialized = [
-                serialize_layer_cached(layer, f"layer-{i}") for i, layer in enumerate(map.layers)
+                serialize_layer_cached(layer, f"layer-{i}", tooltip_spec) for i, layer in enumerate(map.layers)
             ]
 
         map_options: dict[str, Any] = {

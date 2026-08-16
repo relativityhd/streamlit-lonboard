@@ -11,6 +11,15 @@
       "port": 8501
     },
     {
+      "name": "extensions-demo",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 uv run streamlit run examples/extensions_app.py --server.headless true --server.port 8502"
+      ],
+      "port": 8502
+    },
+    {
       "name": "bench-10k",
       "runtimeExecutable": "bash",
       "runtimeArgs": [

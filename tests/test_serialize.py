@@ -756,3 +756,99 @@ def test_check_parameters_json_safe_rejects_non_string_keys():
     with pytest.raises(ValueError, match="must be JSON-safe"):
         serialize.check_parameters_json_safe({1: "not a string key"})
 
+
+@pytest.fixture
+def tooltip_gdf():
+    return gpd.GeoDataFrame(
+        {"name": ["a", "b", "c"], "population": [1, 2, 3]},
+        geometry=[Point(0, 0), Point(1, 1), Point(2, 2)],
+        crs="EPSG:4326",
+    )
+
+
+def test_serialize_layer_tooltip_false_ships_nothing(tooltip_gdf):
+    layer = ScatterplotLayer.from_geopandas(tooltip_gdf, get_fill_color=[255, 0, 0])
+
+    serialized = serialize.serialize_layer(layer, "layer-0")  # tooltip defaults to False
+
+    assert serialized.tooltip_columns == ()
+    assert "name" not in serialized.table.schema.names
+
+
+def test_serialize_layer_tooltip_true_ships_every_non_geometry_column_sorted(tooltip_gdf):
+    layer = ScatterplotLayer.from_geopandas(tooltip_gdf, get_fill_color=[255, 0, 0])
+
+    serialized = serialize.serialize_layer(layer, "layer-0", tooltip=True)
+
+    assert serialized.tooltip_columns == ("name", "population")  # alphabetical, for determinism
+    assert set(serialized.tooltip_columns) <= set(serialized.table.schema.names)
+
+
+def test_serialize_layer_tooltip_explicit_list_preserves_order_and_skips_missing(tooltip_gdf):
+    layer = ScatterplotLayer.from_geopandas(tooltip_gdf, get_fill_color=[255, 0, 0])
+
+    serialized = serialize.serialize_layer(layer, "layer-0", tooltip=("population", "bogus", "name"))
+
+    # request order preserved (not alphabetical, unlike tooltip=True); "bogus"
+    # silently skipped rather than raising - the same `tooltip=` request is
+    # shared across every layer in one st_lonboard() call, and different
+    # layers commonly have different schemas.
+    assert serialized.tooltip_columns == ("population", "name")
+
+
+def test_serialize_layer_tooltip_dedupes_repeated_names(tooltip_gdf):
+    layer = ScatterplotLayer.from_geopandas(tooltip_gdf, get_fill_color=[255, 0, 0])
+
+    serialized = serialize.serialize_layer(layer, "layer-0", tooltip=("name", "name"))
+
+    assert serialized.tooltip_columns == ("name",)
+
+
+def test_serialize_layer_tooltip_excludes_column_colliding_with_accessor_name(tooltip_gdf):
+    """A `get_fill_color` *attribute* column (unrelated data) must not be
+    shipped as a tooltip column when `get_fill_color` is also an accessor -
+    appending both under the same name to the output table would collide.
+    The accessor wins; the attribute column is silently dropped from the
+    tooltip candidate list (regression test for the collision itself, not
+    just "some columns are missing")."""
+    gdf = tooltip_gdf.assign(get_fill_color=["unrelated", "data", "here"])
+    colors = np.array([[255, 0, 0], [0, 255, 0], [0, 0, 255]], dtype="uint8")
+    layer = ScatterplotLayer.from_geopandas(gdf, get_fill_color=colors)
+
+    serialized = serialize.serialize_layer(layer, "layer-0", tooltip=True)
+
+    assert "get_fill_color" not in serialized.tooltip_columns
+    assert set(serialized.tooltip_columns) == {"name", "population"}
+    # the surviving `get_fill_color` column in the table is the color accessor, not the string attribute
+    assert serialized.table.column("get_fill_color").to_pylist() == [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+
+
+def test_pack_payload_tooltip_columns_key_present_only_when_set(tooltip_gdf):
+    layer = ScatterplotLayer.from_geopandas(tooltip_gdf, get_fill_color=[255, 0, 0])
+    with_tooltip = serialize.serialize_layer(layer, "layer-0", tooltip=("name",))
+    without_tooltip = serialize.serialize_layer(layer, "layer-1")
+
+    blob = serialize.pack_payload([with_tooltip, without_tooltip], view_state=None, map_options={}, compression=None)
+
+    header, _ = _unpack(blob)
+    assert header["layers"][0]["tooltipColumns"] == ["name"]
+    assert "tooltipColumns" not in header["layers"][1]
+
+
+def test_serialize_layer_cached_hits_on_same_tooltip_request(tooltip_gdf):
+    layer = ScatterplotLayer.from_geopandas(tooltip_gdf, get_fill_color=[255, 0, 0])
+
+    first = serialize.serialize_layer_cached(layer, "layer-0", tooltip=True)
+    second = serialize.serialize_layer_cached(layer, "layer-0", tooltip=True)
+
+    assert first is second
+
+
+def test_serialize_layer_cached_misses_on_different_tooltip_request(tooltip_gdf):
+    layer = ScatterplotLayer.from_geopandas(tooltip_gdf, get_fill_color=[255, 0, 0])
+
+    first = serialize.serialize_layer_cached(layer, "layer-0", tooltip=True)
+    second = serialize.serialize_layer_cached(layer, "layer-0", tooltip=("name",))
+
+    assert first is not second
+    assert second.tooltip_columns == ("name",)

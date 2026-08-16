@@ -43,6 +43,13 @@ PAYLOAD_FORMAT_VERSION = 1
 
 Compression = Literal["auto", "gzip"] | None
 
+# `st_lonboard(tooltip=...)`: `True` ships every available non-geometry,
+# non-accessor column; a tuple of names ships only those (best-effort - a
+# name absent from this particular layer's table is silently skipped, since
+# one `tooltip=` request is shared across every layer in the call and
+# different layers commonly have different schemas); `False` ships none.
+TooltipSpec = bool | tuple[str, ...]
+
 # "auto" compresses only above this many raw body bytes. Below it, gzip's
 # fixed CPU cost (compress here, decompress + extra round trip in the
 # browser) isn't worth the transfer savings - and on localhost, IPC transfer
@@ -214,6 +221,12 @@ class SerializedLayer:
     layer_type: str
     props: dict[str, Any]
     extensions: list[dict[str, Any]]
+    # The raw `tooltip=` request this was serialized with (for
+    # `serialize_layer_cached`'s cache-hit comparison - cheap, no `layer.table`
+    # access needed) and what it actually resolved to *for this layer*
+    # (shipped on the wire - see `_resolve_tooltip_columns`).
+    tooltip_request: TooltipSpec
+    tooltip_columns: tuple[str, ...]
     table: pa.Table
     ipc_bytes: bytes
 
@@ -322,6 +335,29 @@ def serialize_controls(controls: Any) -> list[dict[str, Any]]:
     return serialized
 
 
+def _resolve_tooltip_columns(table: pa.Table, tooltip: TooltipSpec, *, used_names: set[str]) -> tuple[str, ...]:
+    """Pick which columns of `table` (the layer's full, pre-geometry-selection
+    data table) to ship as hover-tooltip content, per `tooltip` (see
+    `TooltipSpec`). `used_names` (the geometry + accessor column names already
+    going into the output table) is excluded from consideration - re-shipping
+    the geometry column as "tooltip data" is redundant, and an attribute
+    column that happens to share a name with an accessor column would collide
+    when appended to the output table.
+    """
+    if tooltip is False:
+        return ()
+
+    available = [name for name in table.schema.names if name not in used_names]
+    if tooltip is True:
+        return tuple(sorted(available))
+
+    available_set = set(available)
+    # dict.fromkeys: preserves the caller's requested order while silently
+    # collapsing an accidental duplicate name (a second `append_column` with
+    # the same name would otherwise produce an invalid/ambiguous table).
+    return tuple(dict.fromkeys(name for name in tooltip if name in available_set))
+
+
 def _canonicalize_table(table: pa.Table) -> pa.Table:
     """Force deterministic IPC bytes for identical content.
 
@@ -388,7 +424,7 @@ def _rescale_trip_timestamps(chunked: pa.ChunkedArray) -> pa.ChunkedArray:
     return pa.chunked_array([rescaled])
 
 
-def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
+def serialize_layer(layer: Any, layer_id: str, tooltip: TooltipSpec = False) -> SerializedLayer:
     """Serialize a single lonboard layer into scalar props + a minimal Arrow table.
 
     Not cached - see `serialize_layer_cached` for the memoized entry point
@@ -425,6 +461,11 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
         out_table = table.select(keep_columns)
         for name, chunked in accessor_columns.items():
             out_table = out_table.append_column(name, chunked)
+
+        tooltip_columns = _resolve_tooltip_columns(table, tooltip, used_names=set(keep_columns) | set(accessor_columns))
+        for name in tooltip_columns:
+            out_table = out_table.append_column(name, table.column(name))
+
         out_table = _canonicalize_table(out_table)
         ipc_bytes = _table_to_ipc_bytes(out_table)
 
@@ -433,6 +474,8 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
             layer_type=layer_type,
             props=props,
             extensions=extensions,
+            tooltip_request=tooltip,
+            tooltip_columns=tooltip_columns,
             table=out_table,
             ipc_bytes=ipc_bytes,
         )
@@ -469,21 +512,24 @@ def _evict_cache_for_extension_trait_change(change: dict[str, Any]) -> None:
         _layer_cache.pop(layer, None)
 
 
-def serialize_layer_cached(layer: Any, layer_id: str) -> SerializedLayer:
+def serialize_layer_cached(layer: Any, layer_id: str, tooltip: TooltipSpec = False) -> SerializedLayer:
     """Like `serialize_layer`, but memoized on layer object identity.
 
     A cache hit skips table-building *and* the Arrow IPC write entirely.
     Invalidated automatically if any trait on the layer changes (lonboard
     layers are traitlets `HasTraits` instances), if any trait on one of its
-    `extensions` changes, or if the same object is reused at a different
-    `layer_id` (e.g. the app reordered its layers list).
+    `extensions` changes, if `tooltip` differs from what this layer was last
+    serialized with (a plain equality check against the request - like
+    `layer_id`, this needs no `layer.table` access, so a cache *hit* never
+    pays for it), or if the same object is reused at a different `layer_id`
+    (e.g. the app reordered its layers list).
     """
     cached = _layer_cache.get(layer)
-    if cached is not None and cached.layer_id == layer_id:
+    if cached is not None and cached.layer_id == layer_id and cached.tooltip_request == tooltip:
         log("serialize_layer_cached[%s]: hit", layer_id)
         return cached
 
-    serialized = serialize_layer(layer, layer_id)
+    serialized = serialize_layer(layer, layer_id, tooltip)
     _layer_cache[layer] = serialized
     if layer not in _observed_layers:
         layer.observe(_evict_cache_on_trait_change, names=traitlets.All)
@@ -551,6 +597,8 @@ def pack_payload(
             }
             if layer.extensions:
                 layer_header["extensions"] = layer.extensions
+            if layer.tooltip_columns:
+                layer_header["tooltipColumns"] = layer.tooltip_columns
             layer_headers.append(layer_header)
             body.write(ipc_bytes)
 

@@ -74,6 +74,16 @@ interface MountState {
   /** Every control built from `mapOptions.controls` (NOT including the deck.gl overlay itself), so a rerun can remove-and-rebuild them on change. */
   mapControls: maplibregl.IControl[];
   lastControlsJson?: string;
+  /**
+   * lonboard layer id -> tooltip column names, rebuilt fresh from
+   * `header.layers` on every `mount()` call (cheap - no fingerprint gating
+   * needed). Read by `getTooltip`, a callback set once at `MapboxOverlay`
+   * construction and invoked by deck.gl's own hover handling *between*
+   * `mount()` calls - it must read this off `state` (updated in place) rather
+   * than close over a single `header`, or it would keep answering with
+   * whatever tooltip columns were configured at the very first mount.
+   */
+  layerTooltipColumns: Map<string, string[]>;
 }
 
 const MOUNT_KEY = "__stLonboardMount";
@@ -178,6 +188,58 @@ function applyAttribution(state: MountState, customAttribution: string | string[
   }
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** Renders one tooltip column's Arrow-decoded value as display text. */
+function formatTooltipValue(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "object") {
+    // A struct/list-typed tooltip column (uncommon, but not disallowed) -
+    // JSON-stringify rather than showing "[object Object]".
+    try {
+      return JSON.stringify(value, (_key, v) => (typeof v === "bigint" ? v.toString() : v));
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+/**
+ * Builds hover-tooltip HTML for a pick, or `null` for "no tooltip" (nothing
+ * picked, or the picked layer has no `tooltipColumns`). `TooltipWidget` (the
+ * consumer of this return value - see @deck.gl/core's tooltip-widget.js)
+ * sets `el.innerHTML` directly from the `html` field, so every value is
+ * HTML-escaped here - tooltip columns are arbitrary user data, which must
+ * never be interpolated into innerHTML unescaped.
+ */
+function buildTooltipContent(state: MountState, info: PickingInfo): { html: string } | null {
+  if (!info.picked || !info.object || !info.layer) return null;
+
+  const subLayerInfo = state.subLayerLookup.get(info.layer.id);
+  const lonboardLayerId = subLayerInfo?.lonboardLayerId ?? info.layer.id;
+  const columns = state.layerTooltipColumns.get(lonboardLayerId);
+  if (!columns || columns.length === 0) return null;
+
+  // `info.object` is an apache-arrow `StructRowProxy` for this row (see
+  // @geoarrow/deck.gl-geoarrow's getPickingInfo, which does `batch.get(index)`
+  // on a RecordBatch that includes geometry, accessor, *and* tooltip columns)
+  // - each tooltip column name is a valid property to read off it directly.
+  const row = info.object as Record<string, unknown>;
+  const rows = columns
+    .map((col) => `<div>${escapeHtml(col)}: ${escapeHtml(formatTooltipValue(row[col]))}</div>`)
+    .join("");
+  return { html: rows };
+}
+
 function pickPayload(subLayerLookup: Map<string, SubLayerInfo>, info: PickingInfo | null) {
   if (!info || !info.picked || !info.layer) return null;
   const subLayerInfo = subLayerLookup.get(info.layer.id);
@@ -214,6 +276,7 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
     layerCache: new Map<string, LayerCacheEntry>(),
     mapOptions: header.mapOptions,
     mapControls: [],
+    layerTooltipColumns: new Map<string, string[]>(),
   };
 
   const overlay = new MapboxOverlay({
@@ -222,6 +285,7 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
     pickingRadius: header.mapOptions.pickingRadius,
     parameters: header.mapOptions.parameters,
     useDevicePixels: header.mapOptions.useDevicePixels,
+    getTooltip: (info: PickingInfo) => buildTooltipContent(state, info),
     onClick: (info: PickingInfo) => {
       if (!state.mapOptions.onClick) return;
       component.setTriggerValue("clicked", pickPayload(state.subLayerLookup, info));
@@ -292,6 +356,16 @@ export default async function mount(component: ComponentApi): Promise<() => void
   state.subLayerLookup.clear();
   const deckLayers: Layer[] = [];
   const newLayerCache = new Map<string, LayerCacheEntry>();
+
+  // Rebuilt fresh every call (cheap - no need to gate this on either
+  // fingerprint, unlike deck.gl layer construction below) so `getTooltip`
+  // (invoked by deck.gl between mount() calls, on hover) always answers with
+  // this rerun's tooltip configuration.
+  state.layerTooltipColumns = new Map(
+    header.layers
+      .filter((layerHeader) => layerHeader.tooltipColumns && layerHeader.tooltipColumns.length > 0)
+      .map((layerHeader) => [layerHeader.id, layerHeader.tooltipColumns as string[]]),
+  );
 
   for (const parsedLayer of layers) {
     const { header: layerHeader, bytesFingerprint, headerFingerprint, table: freshTable } = parsedLayer;

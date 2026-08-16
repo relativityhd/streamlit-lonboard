@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rendered; there's no way to opt out short of passing `Map(controls=[])`.
   `GeocoderControl` isn't supported (it needs a Python-side async handler with
   no Streamlit equivalent) and is skipped with a warning if present.
+- Hover tooltips: `st_lonboard(tooltip=True)` shows every non-geometry column
+  of each layer's own data; `tooltip=["name", "population"]` shows only those
+  columns (best-effort per layer - a name absent from a particular layer's
+  data is silently skipped). Falls back to the passed `map`'s `show_tooltip`
+  when `tooltip` is left at its default `False`. Requires `pickable=True` on
+  the layer (lonboard's own default).
 
 ### Fixed
 

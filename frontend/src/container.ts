@@ -19,6 +19,8 @@ export interface LayerHeader {
   props: Record<string, unknown>;
   /** Layer extensions attached to this lonboard layer, e.g. `PathStyleExtension`. Omitted when none. */
   extensions?: ExtensionHeader[];
+  /** Column names appended to this layer's Arrow table for hover tooltips (see `st_lonboard(tooltip=...)`). Omitted when none. */
+  tooltipColumns?: string[];
   byteOffset: number;
   byteLength: number;
 }
