@@ -14,7 +14,7 @@ import type { Layer, PickingInfo } from "@deck.gl/core";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { type ContainerHeader, parseContainer } from "./container";
+import { type ContainerHeader, type MapOptions, parseContainer } from "./container";
 import { buildDeckLayers, type SubLayerInfo } from "./layers";
 
 interface ComponentApi {
@@ -47,6 +47,15 @@ interface MountState {
   container: HTMLDivElement;
   subLayerLookup: Map<string, SubLayerInfo>;
   layerCache: Map<string, LayerCacheEntry>;
+  /**
+   * Refreshed from `header.mapOptions` on every `mount()` call (see below) -
+   * read by the overlay callbacks below instead of the `header` parameter
+   * `createMount` closes over, since `createMount` only runs once per
+   * component instance while `mount()` runs on every rerun. Reading from
+   * `header` directly there would freeze onClick/onHover/returnViewState at
+   * whatever they were on the very first mount.
+   */
+  mapOptions: MapOptions;
   lastBasemapStyle?: string;
   hoverThrottle?: ReturnType<typeof setTimeout>;
   viewStateThrottle?: ReturnType<typeof setTimeout>;
@@ -110,17 +119,18 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
     container,
     subLayerLookup: new Map<string, SubLayerInfo>(),
     layerCache: new Map<string, LayerCacheEntry>(),
+    mapOptions: header.mapOptions,
   };
 
   const overlay = new MapboxOverlay({
     interleaved: false,
     layers: [],
     onClick: (info: PickingInfo) => {
-      if (!header.mapOptions.onClick) return;
+      if (!state.mapOptions.onClick) return;
       component.setTriggerValue("clicked", pickPayload(state.subLayerLookup, info));
     },
     onHover: (info: PickingInfo) => {
-      if (!header.mapOptions.onHover) return;
+      if (!state.mapOptions.onHover) return;
       if (state.hoverThrottle !== undefined) return;
       state.hoverThrottle = setTimeout(() => {
         state.hoverThrottle = undefined;
@@ -128,7 +138,7 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
       component.setTriggerValue("hovered", pickPayload(state.subLayerLookup, info));
     },
     onViewStateChange: (params: { viewState: Record<string, unknown> }) => {
-      if (!header.mapOptions.returnViewState) return;
+      if (!state.mapOptions.returnViewState) return;
       if (state.viewStateThrottle !== undefined) return;
       state.viewStateThrottle = setTimeout(() => {
         state.viewStateThrottle = undefined;
@@ -180,6 +190,7 @@ export default async function mount(component: ComponentApi): Promise<() => void
   // so an async mount() is supported (confirmed against the bundled runtime).
   const { header, layers } = await parseContainer(bytes, previousFingerprints);
   const state = existingState ?? createMount(component, header);
+  state.mapOptions = header.mapOptions;
 
   state.subLayerLookup.clear();
   const deckLayers: Layer[] = [];
