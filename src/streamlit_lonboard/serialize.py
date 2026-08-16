@@ -22,6 +22,7 @@ import gzip
 import io
 import json
 import struct
+import warnings
 from dataclasses import dataclass
 from typing import Any, Literal
 from weakref import WeakKeyDictionary, WeakSet
@@ -89,6 +90,17 @@ _REQUIRED_ACCESSORS: dict[str, tuple[str, ...]] = {
 # extension_type string - no renaming table needed, unlike layers.
 SUPPORTED_EXTENSION_TYPES = {"brushing", "collision-filter", "data-filter", "path-style"}
 
+# lonboard `BaseControl._control_type` -> that control's own trait names (see
+# frontend/src/index.ts for the matching maplibregl.*Control registry).
+# `GeocoderControl` is deliberately absent: it requires a Python-side async
+# `client` callback wired over lonboard's ipywidgets comm channel, which has
+# no Streamlit equivalent - `serialize_controls` skips it with a warning.
+_CONTROL_OWN_TRAITS: dict[str, tuple[str, ...]] = {
+    "scale": ("max_width", "unit"),
+    "navigation": ("show_compass", "show_zoom", "visualize_pitch", "visualize_roll"),
+    "fullscreen": (),
+}
+
 # deck.gl prop names that don't follow the generic snake_case -> camelCase
 # rule (see `_snake_to_camel`) - e.g. a leading underscore trait.
 _PROP_NAME_OVERRIDES = {"_current_time": "currentTime"}
@@ -142,6 +154,42 @@ def _is_json_safe(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return all(_is_json_safe(v) for v in value)
     return False
+
+
+def _is_json_safe_value(value: Any) -> bool:
+    """Like `_is_json_safe`, but also allows string-keyed dicts.
+
+    `_is_json_safe` deliberately excludes dicts: it validates a single deck.gl
+    *prop leaf* (a scalar or array), and no layer/extension prop in this
+    codebase is ever shaped like a raw JS object. `parameters=` (deck.gl GPU
+    parameters) is the exception - it's inherently a free-form nested
+    structure (e.g. `{"blendFunc": [...], "depthTest": False}`), so it needs
+    the more general JSON-value check.
+    """
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_json_safe_value(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_safe_value(v) for v in value)
+    return value is None or isinstance(value, (bool, int, float, str))
+
+
+def check_parameters_json_safe(parameters: Any) -> None:
+    """Raise a clear error if `parameters` (deck.gl GPU parameters, forwarded
+    to the frontend as-is) can't survive a JSON round-trip.
+
+    Unlike layer/extension traits, `parameters` isn't traitlets-validated on
+    `lonboard.Map` (it's a bare `t.Any`), so an unsupported value (e.g. a
+    numpy array, or one of the `GL.*` constants lonboard's own docstring
+    warns aren't real JSON) would otherwise only surface much later as a
+    cryptic error from `json.dumps` inside `pack_payload`.
+    """
+    if parameters is not None and not _is_json_safe_value(parameters):
+        raise ValueError(
+            "st_lonboard: `parameters` must be JSON-safe (a nested dict/list/tuple of "
+            "None, bool, int, float, or str) - got a value that isn't. If you're using "
+            "one of luma.gl's `GL.*` constants, pass the underlying integer instead (see "
+            f"the `parameters` docstring on `lonboard.Map`). Got: {parameters!r}"
+        )
 
 
 def _geometry_column_names(schema: pa.Schema) -> list[str]:
@@ -238,6 +286,40 @@ def serialize_extensions(layer: Any) -> list[dict[str, Any]]:
         extensions.append({"type": extension_type, "props": props})
 
     return extensions
+
+
+def serialize_controls(controls: Any) -> list[dict[str, Any]]:
+    """Serialize a `lonboard.Map.controls` tuple into wire-format control headers.
+
+    Each entry is `{"type": <lonboard _control_type>, "position": ..., "options": {...}}`.
+    An unrecognized control type (currently just `GeocoderControl` - see
+    `_CONTROL_OWN_TRAITS`) is skipped with a warning rather than raised as an
+    error: unlike an unsupported layer or extension, a control is decorative
+    (zoom buttons, a scale bar, ...) and the map is still fully usable without
+    it, so failing the whole render over one skipped control would be worse
+    than just not drawing it.
+    """
+    serialized: list[dict[str, Any]] = []
+    for ctrl in controls or ():
+        control_type = ctrl._control_type
+        own_trait_names = _CONTROL_OWN_TRAITS.get(control_type)
+        if own_trait_names is None:
+            warnings.warn(
+                f"st_lonboard: skipping unsupported map control {control_type!r} - "
+                "only 'scale', 'navigation', and 'fullscreen' controls are supported",
+                stacklevel=2,
+            )
+            continue
+
+        options: dict[str, Any] = {}
+        for name in own_trait_names:
+            value = getattr(ctrl, name, None)
+            if value is not None:
+                options[_snake_to_camel(name)] = value
+
+        serialized.append({"type": control_type, "position": ctrl.position, "options": options})
+
+    return serialized
 
 
 def _canonicalize_table(table: pa.Table) -> pa.Table:

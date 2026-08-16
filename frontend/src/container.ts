@@ -31,6 +31,14 @@ export interface MapViewState {
   bearing?: number;
 }
 
+/** One `lonboard.Map.controls` entry - see `streamlit_lonboard.serialize.serialize_controls`. */
+export interface ControlHeader {
+  /** lonboard `BaseControl._control_type`, e.g. "navigation". */
+  type: string;
+  position: "top-left" | "top-right" | "bottom-left" | "bottom-right" | null;
+  options: Record<string, unknown>;
+}
+
 export interface MapOptions {
   basemapStyle?: string;
   height?: number;
@@ -39,6 +47,14 @@ export interface MapOptions {
   returnViewState?: boolean;
   /** Mirrors ST_LONBOARD_PERF=1 on the Python side; logs a perf summary to the console. */
   perf?: boolean;
+  /** Extra pixels around the pointer to include while picking. deck.gl default: 0. */
+  pickingRadius?: number;
+  /** deck.gl GPU parameters (`luma.gl`'s `setParameters`), e.g. `{depthTest: false}`. */
+  parameters?: Record<string, unknown>;
+  /** `false`/a number <= 1 improves performance on high-DPI displays. deck.gl default: `true`. */
+  useDevicePixels?: boolean | number;
+  customAttribution?: string | string[];
+  controls?: ControlHeader[];
 }
 
 export interface ContainerHeader {

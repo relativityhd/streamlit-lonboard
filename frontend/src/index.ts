@@ -15,7 +15,7 @@ import { MapboxOverlay } from "@deck.gl/mapbox";
 import type { Table } from "apache-arrow";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { type ContainerHeader, type MapOptions, parseContainer } from "./container";
+import { type ContainerHeader, type ControlHeader, type MapOptions, parseContainer } from "./container";
 import { buildDeckLayers, type SubLayerInfo } from "./layers";
 
 interface ComponentApi {
@@ -68,6 +68,12 @@ interface MountState {
   lastBasemapStyle?: string;
   hoverThrottle?: ReturnType<typeof setTimeout>;
   viewStateThrottle?: ReturnType<typeof setTimeout>;
+  /** Present only while `mapOptions.customAttribution` is set - maplibre-gl has no "update attribution" API, so a change means remove-and-recreate. */
+  attributionControl?: maplibregl.AttributionControl;
+  lastCustomAttributionJson?: string;
+  /** Every control built from `mapOptions.controls` (NOT including the deck.gl overlay itself), so a rerun can remove-and-rebuild them on change. */
+  mapControls: maplibregl.IControl[];
+  lastControlsJson?: string;
 }
 
 const MOUNT_KEY = "__stLonboardMount";
@@ -92,6 +98,84 @@ function logPerfSummary(): void {
   }
   performance.clearMarks();
   performance.clearMeasures();
+}
+
+/**
+ * Instantiates the maplibre-gl control matching one `lonboard.Map.controls`
+ * entry. Unrecognized types are skipped (with a warning) rather than thrown -
+ * `serialize_controls` already filters these Python-side, so this only fires
+ * on a frontend/Python version mismatch; mirrors `buildDeckLayers`/
+ * `buildLayerExtensions`'s "skip the one broken thing, keep the map usable"
+ * handling of an unsupported type.
+ *
+ * Every field below gets an explicit `?? <maplibre's own documented default>`
+ * fallback rather than passing a possibly-`undefined` value straight through.
+ * This matters: `ScaleControl`'s constructor merges options via
+ * `{...defaultOptions, ...options}` and `NavigationControl`'s via a `for...in`
+ * copy (`extend()`, in maplibre-gl's util) - both treat an explicit
+ * `key: undefined` as "present," clobbering the default with `undefined`
+ * rather than leaving it alone (confirmed against maplibre-gl's own source,
+ * and against a live map: leaving this unfallback'd silently produced a
+ * `NavigationControl` with *no* zoom buttons, since an absent `show_zoom` on
+ * the Python side arrives here as `options.showZoom === undefined`, which
+ * then overwrote the constructor's own `showZoom: true` default).
+ */
+function buildMaplibreControl(header: ControlHeader): maplibregl.IControl | null {
+  const options = header.options;
+  switch (header.type) {
+    case "scale":
+      return new maplibregl.ScaleControl({
+        maxWidth: (options.maxWidth as number | undefined) ?? 100,
+        unit: (options.unit as maplibregl.Unit | undefined) ?? "metric",
+      });
+    case "navigation":
+      // `visualizeRoll` (a lonboard NavigationControl trait) has no
+      // equivalent in the maplibre-gl version this project currently pins
+      // (^4.7.1 - NavigationControlOptions there has no such field) - not
+      // forwarded. A future maplibre-gl upgrade would pick it up once added
+      // here; until then it's silently a no-op rather than an error, since
+      // every *other* navigation option still works fine without it.
+      return new maplibregl.NavigationControl({
+        showCompass: (options.showCompass as boolean | undefined) ?? true,
+        showZoom: (options.showZoom as boolean | undefined) ?? true,
+        visualizePitch: (options.visualizePitch as boolean | undefined) ?? false,
+      });
+    case "fullscreen":
+      return new maplibregl.FullscreenControl();
+    default:
+      console.warn(`streamlit-lonboard: unsupported map control "${header.type}"`);
+      return null;
+  }
+}
+
+/** Replaces every non-overlay control on the map with a fresh set built from `controlHeaders`. */
+function applyControls(state: MountState, controlHeaders: ControlHeader[] | undefined): void {
+  for (const ctrl of state.mapControls) {
+    state.map.removeControl(ctrl);
+  }
+  state.mapControls = [];
+  for (const controlHeader of controlHeaders ?? []) {
+    const ctrl = buildMaplibreControl(controlHeader);
+    if (!ctrl) continue;
+    state.map.addControl(ctrl, controlHeader.position ?? undefined);
+    state.mapControls.push(ctrl);
+  }
+}
+
+/**
+ * maplibre-gl has no way to update an existing `AttributionControl`'s
+ * `customAttribution` in place, so a change means removing the old instance
+ * (if any) and adding a new one (if `customAttribution` is now set).
+ */
+function applyAttribution(state: MountState, customAttribution: string | string[] | undefined): void {
+  if (state.attributionControl) {
+    state.map.removeControl(state.attributionControl);
+    state.attributionControl = undefined;
+  }
+  if (customAttribution !== undefined) {
+    state.attributionControl = new maplibregl.AttributionControl({ customAttribution });
+    state.map.addControl(state.attributionControl);
+  }
 }
 
 function pickPayload(subLayerLookup: Map<string, SubLayerInfo>, info: PickingInfo | null) {
@@ -129,11 +213,15 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
     subLayerLookup: new Map<string, SubLayerInfo>(),
     layerCache: new Map<string, LayerCacheEntry>(),
     mapOptions: header.mapOptions,
+    mapControls: [],
   };
 
   const overlay = new MapboxOverlay({
     interleaved: false,
     layers: [],
+    pickingRadius: header.mapOptions.pickingRadius,
+    parameters: header.mapOptions.parameters,
+    useDevicePixels: header.mapOptions.useDevicePixels,
     onClick: (info: PickingInfo) => {
       if (!state.mapOptions.onClick) return;
       component.setTriggerValue("clicked", pickPayload(state.subLayerLookup, info));
@@ -275,7 +363,12 @@ export default async function mount(component: ComponentApi): Promise<() => void
   state.layerCache = newLayerCache;
 
   performance.mark("st-lonboard:setProps:start");
-  state.overlay.setProps({ layers: deckLayers });
+  state.overlay.setProps({
+    layers: deckLayers,
+    pickingRadius: header.mapOptions.pickingRadius,
+    parameters: header.mapOptions.parameters,
+    useDevicePixels: header.mapOptions.useDevicePixels,
+  });
   performance.mark("st-lonboard:setProps:end");
   performance.measure("st-lonboard:setProps", "st-lonboard:setProps:start", "st-lonboard:setProps:end");
 
@@ -289,6 +382,22 @@ export default async function mount(component: ComponentApi): Promise<() => void
   if (state.container.style.height !== `${height}px`) {
     state.container.style.height = `${height}px`;
     state.map.resize();
+  }
+
+  // maplibre-gl has no in-place "update" for either of these, so both are
+  // fully rebuilt on change - cheap (a handful of DOM nodes), and `state.lastX`
+  // starts `undefined` on a fresh mount, so this same block also performs the
+  // *initial* build (no separate seeding needed in createMount).
+  const customAttributionJson = JSON.stringify(header.mapOptions.customAttribution ?? null);
+  if (customAttributionJson !== state.lastCustomAttributionJson) {
+    applyAttribution(state, header.mapOptions.customAttribution);
+    state.lastCustomAttributionJson = customAttributionJson;
+  }
+
+  const controlsJson = JSON.stringify(header.mapOptions.controls ?? []);
+  if (controlsJson !== state.lastControlsJson) {
+    applyControls(state, header.mapOptions.controls);
+    state.lastControlsJson = controlsJson;
   }
 
   performance.mark("st-lonboard:mount:end");

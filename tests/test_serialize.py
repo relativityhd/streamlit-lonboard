@@ -29,6 +29,7 @@ from lonboard import (
     SolidPolygonLayer,
     TripsLayer,
 )
+from lonboard.controls import FullscreenControl, GeocoderControl, NavigationControl, ScaleControl
 from lonboard.layer_extension import (
     BrushingExtension,
     CollisionFilterExtension,
@@ -687,4 +688,71 @@ def test_serialize_layer_cached_hits_when_extension_untouched(path_gdf):
     first = serialize.serialize_layer_cached(layer, "layer-0")
     for _ in range(3):
         assert serialize.serialize_layer_cached(layer, "layer-0") is first
+
+
+def test_serialize_controls_default_map_controls_have_empty_options():
+    """`Map()`'s own default `controls` (fullscreen, navigation, scale) all
+    have every own-trait left at `None` - `serialize_controls` should ship
+    them with empty `options`, letting maplibre-gl fall back to its own
+    per-control defaults rather than us hardcoding what they are."""
+    controls = (FullscreenControl(), NavigationControl(), ScaleControl())
+
+    serialized = serialize.serialize_controls(controls)
+
+    assert serialized == [
+        {"type": "fullscreen", "position": None, "options": {}},
+        {"type": "navigation", "position": None, "options": {}},
+        {"type": "scale", "position": None, "options": {}},
+    ]
+
+
+def test_serialize_controls_ships_only_explicitly_set_options():
+    controls = (
+        NavigationControl(show_compass=False, position="top-right"),
+        ScaleControl(max_width=80, unit="imperial"),
+    )
+
+    serialized = serialize.serialize_controls(controls)
+
+    assert serialized == [
+        {"type": "navigation", "position": "top-right", "options": {"showCompass": False}},
+        {"type": "scale", "position": None, "options": {"maxWidth": 80, "unit": "imperial"}},
+    ]
+
+
+def test_serialize_controls_skips_unsupported_type_with_warning():
+    """`GeocoderControl` needs a Python-side async `client` callback wired
+    over lonboard's ipywidgets comm channel - no Streamlit equivalent, so it's
+    dropped (with a warning) rather than raised as an error: unlike a layer or
+    extension, a missing control still leaves a fully usable map."""
+
+    async def _dummy_client(query: str) -> None:
+        return None
+
+    controls = (GeocoderControl(client=_dummy_client), FullscreenControl())
+
+    with pytest.warns(UserWarning, match="skipping unsupported map control 'geocoder'"):
+        serialized = serialize.serialize_controls(controls)
+
+    assert serialized == [{"type": "fullscreen", "position": None, "options": {}}]
+
+
+def test_serialize_controls_handles_empty_and_none():
+    assert serialize.serialize_controls(()) == []
+    assert serialize.serialize_controls(None) == []
+
+
+def test_check_parameters_json_safe_accepts_none_and_nested_values():
+    serialize.check_parameters_json_safe(None)
+    serialize.check_parameters_json_safe({"depthTest": False, "blendFunc": [1, 2, 3, 4]})
+
+
+def test_check_parameters_json_safe_rejects_non_json_values():
+    with pytest.raises(ValueError, match="must be JSON-safe"):
+        serialize.check_parameters_json_safe({"bad": np.array([1, 2, 3])})
+
+
+def test_check_parameters_json_safe_rejects_non_string_keys():
+    with pytest.raises(ValueError, match="must be JSON-safe"):
+        serialize.check_parameters_json_safe({1: "not a string key"})
 

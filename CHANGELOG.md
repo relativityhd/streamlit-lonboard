@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get_dash_array`, `filter_range`) already shipped before this change; what
   was missing was instantiating the extension itself on the frontend, which is
   what actually activates deck.gl's shader-level behavior.
+- `st_lonboard()` now forwards more of `lonboard.Map`: `picking_radius`,
+  `parameters` (deck.gl GPU parameters), `use_device_pixels`, and
+  `custom_attribution`, each as a new keyword argument defaulting to the
+  passed `map`'s own value. `map.controls` (a fullscreen button, zoom/compass
+  buttons, and a scale bar by default - lonboard's own default) is now always
+  rendered; there's no way to opt out short of passing `Map(controls=[])`.
+  `GeocoderControl` isn't supported (it needs a Python-side async handler with
+  no Streamlit equivalent) and is skipped with a warning if present.
 
 ### Fixed
 
