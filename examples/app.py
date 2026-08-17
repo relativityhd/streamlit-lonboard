@@ -20,6 +20,18 @@ st.title("streamlit-lonboard demo")
 
 st.button("Rerun (view state / pan+zoom should survive this)")
 
+# Regression check: the map instance is only ever created once (see
+# createMount in index.ts), so onClick/onHover/returnViewState must be read
+# from state - refreshed every mount() call - rather than closed over from
+# the first mount's header. Toggling this WITHOUT the map remounting and then
+# clicking a feature must reflect the *current* toggle state.
+if "on_click_enabled" not in st.session_state:
+    st.session_state.on_click_enabled = True
+if st.button("Toggle on_click (regression check, see comment above)"):
+    st.session_state.on_click_enabled = not st.session_state.on_click_enabled
+on_click_enabled = st.session_state.on_click_enabled
+st.caption(f"on_click is currently **{'ON' if on_click_enabled else 'OFF'}**")
+
 
 @st.cache_resource
 def build_scatter_layer() -> ScatterplotLayer:
@@ -73,7 +85,7 @@ polygon_layer = build_polygon_layer()
 result = st_lonboard(
     layers=[scatter_layer, path_layer, polygon_layer],
     height=600,
-    on_click=True,
+    on_click=on_click_enabled,
     on_hover=True,
     return_view_state=True,
     key="map",
