@@ -34,6 +34,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer types (lonboard has no auto-viewport for S2/A5/Geohash/Arc, and H3
   auto-centering needs `h3-py` installed) - pass an explicit `view_state=`.
 - New `examples/dggs_app.py` demonstrating H3 and Arc layers.
+- Support for lonboard's layer extensions: `PathStyleExtension` (dashed/offset
+  paths), `DataFilterExtension` (GPU-side numeric/category filtering - pairs
+  well with `st.slider` driving `layer.filter_range`), `BrushingExtension`, and
+  `CollisionFilterExtension`. The layer-side props an extension injects (e.g.
+  `get_dash_array`, `filter_range`) already shipped before this change; what
+  was missing was instantiating the extension itself on the frontend, which is
+  what actually activates deck.gl's shader-level behavior.
+- `st_lonboard()` now forwards more of `lonboard.Map`: `picking_radius`,
+  `parameters` (deck.gl GPU parameters), `use_device_pixels`, and
+  `custom_attribution`, each as a new keyword argument defaulting to the
+  passed `map`'s own value. `map.controls` (a fullscreen button, zoom/compass
+  buttons, and a scale bar by default - lonboard's own default) is now always
+  rendered; there's no way to opt out short of passing `Map(controls=[])`.
+  `GeocoderControl` isn't supported (it needs a Python-side async handler with
+  no Streamlit equivalent) and is skipped with a warning if present.
+- Hover tooltips: `st_lonboard(tooltip=True)` shows every non-geometry column
+  of each layer's own data; `tooltip=["name", "population"]` shows only those
+  columns (best-effort per layer - a name absent from a particular layer's
+  data is silently skipped). Falls back to the passed `map`'s `show_tooltip`
+  when `tooltip` is left at its default `False`. Requires `pickable=True` on
+  the layer (lonboard's own default).
+
+### Fixed
+
+- A rerun that changed only a layer's JSON props (e.g. a slider driving `opacity`
+  or `filter_range`) while its Arrow geometry/accessor bytes stayed identical was
+  silently ignored - the frontend's per-layer cache fingerprinted only the Arrow
+  IPC bytes, so it reused the previous render verbatim, props and all. The cache
+  now fingerprints props separately from the Arrow bytes, so prop-only changes
+  are still picked up while byte-identical layers still skip the expensive
+  `tableFromIPC` parse.
 
 ## [0.1.0] - 2026-07-28
 

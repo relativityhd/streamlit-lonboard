@@ -27,6 +27,7 @@ import {
 } from "@geoarrow/deck.gl-geoarrow";
 import type { RecordBatch, Table } from "apache-arrow";
 import type { LayerHeader } from "./container";
+import { buildLayerExtensions } from "./extensions";
 
 // deck.gl composite layer constructors aren't uniformly typed across GeoArrow*Layer classes.
 type AnyLayerClass = new (props: any) => Layer;
@@ -95,6 +96,12 @@ export function buildDeckLayers(
     return [];
   }
 
+  // Built once per lonboard layer and reused across its per-batch
+  // sub-layers below - deck.gl extension instances carry no batch-specific
+  // state, and each sub-layer's own prop diffing (keyed by `id`) handles
+  // sharing the same instance across multiple deck.gl layers correctly.
+  const extensions = buildLayerExtensions(layerHeader.extensions, layerHeader.id);
+
   const layers: Layer[] = [];
   let rowOffset = 0;
   table.batches.forEach((batch, batchIndex) => {
@@ -103,6 +110,7 @@ export function buildDeckLayers(
     layers.push(
       new LayerClass({
         ...props,
+        ...(extensions.length > 0 ? { extensions } : {}),
         id: subLayerId,
         data: batch,
       }),

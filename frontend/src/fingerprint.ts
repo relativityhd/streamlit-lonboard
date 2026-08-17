@@ -18,3 +18,21 @@ export function fnv1a(bytes: Uint8Array): string {
   }
   return (hash >>> 0).toString(16);
 }
+
+/**
+ * Same algorithm as `fnv1a`, but over a JS string directly (hashing each
+ * UTF-16 code unit as two bytes) instead of a `Uint8Array` - avoids a
+ * `TextEncoder` allocation on every rerun for callers hashing JSON-stringified
+ * props rather than binary payloads.
+ */
+export function fnv1aString(str: string): string {
+  let hash = FNV_OFFSET_BASIS;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    hash ^= code & 0xff;
+    hash = Math.imul(hash, FNV_PRIME);
+    hash ^= code >> 8;
+    hash = Math.imul(hash, FNV_PRIME);
+  }
+  return (hash >>> 0).toString(16);
+}

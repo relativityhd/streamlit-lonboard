@@ -22,9 +22,10 @@ import gzip
 import io
 import json
 import struct
+import warnings
 from dataclasses import dataclass
 from typing import Any, Literal
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakSet
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -41,6 +42,13 @@ _EXTENSION_NAME_KEY = b"ARROW:extension:name"
 PAYLOAD_FORMAT_VERSION = 1
 
 Compression = Literal["auto", "gzip"] | None
+
+# `st_lonboard(tooltip=...)`: `True` ships every available non-geometry,
+# non-accessor column; a tuple of names ships only those (best-effort - a
+# name absent from this particular layer's table is silently skipped, since
+# one `tooltip=` request is shared across every layer in the call and
+# different layers commonly have different schemas); `False` ships none.
+TooltipSpec = bool | tuple[str, ...]
 
 # "auto" compresses only above this many raw body bytes. Below it, gzip's
 # fixed CPU cost (compress here, decompress + extra round trip in the
@@ -84,6 +92,22 @@ _REQUIRED_ACCESSORS: dict[str, tuple[str, ...]] = {
     "arc": ("get_source_position", "get_target_position"),
 }
 
+# lonboard `BaseExtension._extension_type` values this frontend knows how to
+# instantiate (see frontend/src/extensions.ts). The wire "type" IS the
+# extension_type string - no renaming table needed, unlike layers.
+SUPPORTED_EXTENSION_TYPES = {"brushing", "collision-filter", "data-filter", "path-style"}
+
+# lonboard `BaseControl._control_type` -> that control's own trait names (see
+# frontend/src/index.ts for the matching maplibregl.*Control registry).
+# `GeocoderControl` is deliberately absent: it requires a Python-side async
+# `client` callback wired over lonboard's ipywidgets comm channel, which has
+# no Streamlit equivalent - `serialize_controls` skips it with a warning.
+_CONTROL_OWN_TRAITS: dict[str, tuple[str, ...]] = {
+    "scale": ("max_width", "unit"),
+    "navigation": ("show_compass", "show_zoom", "visualize_pitch", "visualize_roll"),
+    "fullscreen": (),
+}
+
 # deck.gl prop names that don't follow the generic snake_case -> camelCase
 # rule (see `_snake_to_camel`) - e.g. a leading underscore trait.
 _PROP_NAME_OVERRIDES = {"_current_time": "currentTime"}
@@ -96,14 +120,16 @@ _PROP_NAME_OVERRIDES = {"_current_time": "currentTime"}
 # represent exactly as an integer.
 _TRIP_TIMESTAMP_OFFSET_BASE = -16777216
 
-# Traits that are never forwarded as props (internal/comm/ipywidgets plumbing).
+# Traits that are never forwarded as generic props (internal/comm/ipywidgets
+# plumbing, or - like `extensions` - handled by their own dedicated
+# serialization path instead of the generic one below).
 _IGNORED_TRAITS = {
     "table",
     "_layer_type",
     "comm",
     "log",
     "keys",
-    "extensions",
+    "extensions",  # see `serialize_extensions`
     "before_id",
     "selected_index",
     "_model_module",
@@ -137,6 +163,42 @@ def _is_json_safe(value: Any) -> bool:
     return False
 
 
+def _is_json_safe_value(value: Any) -> bool:
+    """Like `_is_json_safe`, but also allows string-keyed dicts.
+
+    `_is_json_safe` deliberately excludes dicts: it validates a single deck.gl
+    *prop leaf* (a scalar or array), and no layer/extension prop in this
+    codebase is ever shaped like a raw JS object. `parameters=` (deck.gl GPU
+    parameters) is the exception - it's inherently a free-form nested
+    structure (e.g. `{"blendFunc": [...], "depthTest": False}`), so it needs
+    the more general JSON-value check.
+    """
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_json_safe_value(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_safe_value(v) for v in value)
+    return value is None or isinstance(value, (bool, int, float, str))
+
+
+def check_parameters_json_safe(parameters: Any) -> None:
+    """Raise a clear error if `parameters` (deck.gl GPU parameters, forwarded
+    to the frontend as-is) can't survive a JSON round-trip.
+
+    Unlike layer/extension traits, `parameters` isn't traitlets-validated on
+    `lonboard.Map` (it's a bare `t.Any`), so an unsupported value (e.g. a
+    numpy array, or one of the `GL.*` constants lonboard's own docstring
+    warns aren't real JSON) would otherwise only surface much later as a
+    cryptic error from `json.dumps` inside `pack_payload`.
+    """
+    if parameters is not None and not _is_json_safe_value(parameters):
+        raise ValueError(
+            "st_lonboard: `parameters` must be JSON-safe (a nested dict/list/tuple of "
+            "None, bool, int, float, or str) - got a value that isn't. If you're using "
+            "one of luma.gl's `GL.*` constants, pass the underlying integer instead (see "
+            f"the `parameters` docstring on `lonboard.Map`). Got: {parameters!r}"
+        )
+
+
 def _geometry_column_names(schema: pa.Schema) -> list[str]:
     names = []
     for field in schema:
@@ -158,6 +220,13 @@ class SerializedLayer:
     layer_id: str
     layer_type: str
     props: dict[str, Any]
+    extensions: list[dict[str, Any]]
+    # The raw `tooltip=` request this was serialized with (for
+    # `serialize_layer_cached`'s cache-hit comparison - cheap, no `layer.table`
+    # access needed) and what it actually resolved to *for this layer*
+    # (shipped on the wire - see `_resolve_tooltip_columns`).
+    tooltip_request: TooltipSpec
+    tooltip_columns: tuple[str, ...]
     table: pa.Table
     ipc_bytes: bytes
 
@@ -186,6 +255,107 @@ def build_layer_props(layer: Any) -> tuple[dict[str, Any], dict[str, pa.ChunkedA
             props[prop_name] = value
 
     return props, accessor_columns
+
+
+def serialize_extensions(layer: Any) -> list[dict[str, Any]]:
+    """Serialize a layer's `extensions` tuple into wire-format extension headers.
+
+    Each entry is `{"type": <lonboard _extension_type>, "props": {...}}`, where
+    `props` holds only the extension object's *own* config traits (e.g.
+    `PathStyleExtension.dash`, `DataFilterExtension.filter_size`), camelCased
+    like any other prop.
+
+    This deliberately does *not* handle the layer-side traits an extension
+    injects (e.g. `get_dash_array`, `filter_range`) - by the time
+    `BaseLayer.__init__` returns, those are ordinary traits *on the layer*
+    (lonboard's `_add_extension_traits` calls `HasTraits.add_traits(self,
+    **extension._layer_traits)`), so `build_layer_props()` already picks them
+    up with no changes needed here.
+    """
+    extensions: list[dict[str, Any]] = []
+    for ext in getattr(layer, "extensions", ()) or ():
+        extension_type = ext._extension_type
+        if extension_type not in SUPPORTED_EXTENSION_TYPES:
+            raise ValueError(
+                f"streamlit-lonboard does not yet support the {extension_type!r} layer "
+                f"extension. Supported extensions: {sorted(SUPPORTED_EXTENSION_TYPES)}"
+            )
+
+        # `_layer_traits` names never actually appear in `ext.trait_names()`
+        # (they're injected onto the *layer*, not the extension) - excluded
+        # here anyway as a defensive mirror of lonboard's own layer/extension
+        # trait split, in case a future lonboard version changes that.
+        own_trait_names = set(ext.trait_names()) - _IGNORED_TRAITS - {"_extension_type"}
+        own_trait_names -= set(type(ext)._layer_traits)
+
+        props: dict[str, Any] = {}
+        for name in sorted(own_trait_names):
+            value = getattr(ext, name, None)
+            if value is None:
+                continue
+            if _is_json_safe(value):
+                props[_PROP_NAME_OVERRIDES.get(name) or _snake_to_camel(name)] = value
+
+        extensions.append({"type": extension_type, "props": props})
+
+    return extensions
+
+
+def serialize_controls(controls: Any) -> list[dict[str, Any]]:
+    """Serialize a `lonboard.Map.controls` tuple into wire-format control headers.
+
+    Each entry is `{"type": <lonboard _control_type>, "position": ..., "options": {...}}`.
+    An unrecognized control type (currently just `GeocoderControl` - see
+    `_CONTROL_OWN_TRAITS`) is skipped with a warning rather than raised as an
+    error: unlike an unsupported layer or extension, a control is decorative
+    (zoom buttons, a scale bar, ...) and the map is still fully usable without
+    it, so failing the whole render over one skipped control would be worse
+    than just not drawing it.
+    """
+    serialized: list[dict[str, Any]] = []
+    for ctrl in controls or ():
+        control_type = ctrl._control_type
+        own_trait_names = _CONTROL_OWN_TRAITS.get(control_type)
+        if own_trait_names is None:
+            warnings.warn(
+                f"st_lonboard: skipping unsupported map control {control_type!r} - "
+                "only 'scale', 'navigation', and 'fullscreen' controls are supported",
+                stacklevel=2,
+            )
+            continue
+
+        options: dict[str, Any] = {}
+        for name in own_trait_names:
+            value = getattr(ctrl, name, None)
+            if value is not None:
+                options[_snake_to_camel(name)] = value
+
+        serialized.append({"type": control_type, "position": ctrl.position, "options": options})
+
+    return serialized
+
+
+def _resolve_tooltip_columns(table: pa.Table, tooltip: TooltipSpec, *, used_names: set[str]) -> tuple[str, ...]:
+    """Pick which columns of `table` (the layer's full, pre-geometry-selection
+    data table) to ship as hover-tooltip content, per `tooltip` (see
+    `TooltipSpec`). `used_names` (the geometry + accessor column names already
+    going into the output table) is excluded from consideration - re-shipping
+    the geometry column as "tooltip data" is redundant, and an attribute
+    column that happens to share a name with an accessor column would collide
+    when appended to the output table.
+    """
+    if tooltip is False:
+        return ()
+
+    available = [name for name in table.schema.names if name not in used_names]
+    if tooltip is True:
+        return tuple(sorted(available))
+
+    available_set = set(available)
+    # dict.fromkeys: preserves the caller's requested order while silently
+    # collapsing an accidental duplicate name (a second `append_column` with
+    # the same name would otherwise produce an invalid/ambiguous table).
+    return tuple(dict.fromkeys(name for name in tooltip if name in available_set))
 
 
 def _canonicalize_table(table: pa.Table) -> pa.Table:
@@ -254,7 +424,7 @@ def _rescale_trip_timestamps(chunked: pa.ChunkedArray) -> pa.ChunkedArray:
     return pa.chunked_array([rescaled])
 
 
-def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
+def serialize_layer(layer: Any, layer_id: str, tooltip: TooltipSpec = False) -> SerializedLayer:
     """Serialize a single lonboard layer into scalar props + a minimal Arrow table.
 
     Not cached - see `serialize_layer_cached` for the memoized entry point
@@ -271,6 +441,7 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
 
         table = pa.table(layer.table)
         props, accessor_columns = build_layer_props(layer)
+        extensions = serialize_extensions(layer)
 
         keep_columns = _geometry_column_names(table.schema)
         if not keep_columns and layer._layer_type not in ACCESSOR_GEOMETRY_LAYER_TYPES:
@@ -285,13 +456,16 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
                 )
 
         if layer._layer_type == "trip" and "get_timestamps" in accessor_columns:
-            accessor_columns["get_timestamps"] = _rescale_trip_timestamps(
-                accessor_columns["get_timestamps"]
-            )
+            accessor_columns["get_timestamps"] = _rescale_trip_timestamps(accessor_columns["get_timestamps"])
 
         out_table = table.select(keep_columns)
         for name, chunked in accessor_columns.items():
             out_table = out_table.append_column(name, chunked)
+
+        tooltip_columns = _resolve_tooltip_columns(table, tooltip, used_names=set(keep_columns) | set(accessor_columns))
+        for name in tooltip_columns:
+            out_table = out_table.append_column(name, table.column(name))
+
         out_table = _canonicalize_table(out_table)
         ipc_bytes = _table_to_ipc_bytes(out_table)
 
@@ -299,6 +473,9 @@ def serialize_layer(layer: Any, layer_id: str) -> SerializedLayer:
             layer_id=layer_id,
             layer_type=layer_type,
             props=props,
+            extensions=extensions,
+            tooltip_request=tooltip,
+            tooltip_columns=tooltip_columns,
             table=out_table,
             ipc_bytes=ipc_bytes,
         )
@@ -314,30 +491,57 @@ _layer_cache: "WeakKeyDictionary[Any, SerializedLayer]" = WeakKeyDictionary()
 # Tracks which layer objects already have our invalidation observer attached,
 # so we don't re-attach it (and re-evict) on every cache hit.
 _observed_layers: "WeakKeyDictionary[Any, None]" = WeakKeyDictionary()
+# Same, but for extension objects (`ext.dash = False` etc. must also evict
+# the owning layer's cache entry - the layer-level observer above only fires
+# for traits *on the layer itself*, not on a separate extension object it
+# merely references).
+_observed_extensions: "WeakKeyDictionary[Any, None]" = WeakKeyDictionary()
+# Which layer(s) currently reference a given extension object, so its
+# trait-change observer knows which cache entries to evict. A `WeakSet` of
+# layers (not a plain set) so this mapping doesn't itself keep layers alive -
+# an extension is, in principle, shareable across more than one layer.
+_extension_owners: "WeakKeyDictionary[Any, WeakSet]" = WeakKeyDictionary()
 
 
 def _evict_cache_on_trait_change(change: dict[str, Any]) -> None:
     _layer_cache.pop(change["owner"], None)
 
 
-def serialize_layer_cached(layer: Any, layer_id: str) -> SerializedLayer:
+def _evict_cache_for_extension_trait_change(change: dict[str, Any]) -> None:
+    for layer in _extension_owners.get(change["owner"], ()):
+        _layer_cache.pop(layer, None)
+
+
+def serialize_layer_cached(layer: Any, layer_id: str, tooltip: TooltipSpec = False) -> SerializedLayer:
     """Like `serialize_layer`, but memoized on layer object identity.
 
     A cache hit skips table-building *and* the Arrow IPC write entirely.
     Invalidated automatically if any trait on the layer changes (lonboard
-    layers are traitlets `HasTraits` instances), or if the same object is
-    reused at a different `layer_id` (e.g. the app reordered its layers list).
+    layers are traitlets `HasTraits` instances), if any trait on one of its
+    `extensions` changes, if `tooltip` differs from what this layer was last
+    serialized with (a plain equality check against the request - like
+    `layer_id`, this needs no `layer.table` access, so a cache *hit* never
+    pays for it), or if the same object is reused at a different `layer_id`
+    (e.g. the app reordered its layers list).
     """
     cached = _layer_cache.get(layer)
-    if cached is not None and cached.layer_id == layer_id:
+    if cached is not None and cached.layer_id == layer_id and cached.tooltip_request == tooltip:
         log("serialize_layer_cached[%s]: hit", layer_id)
         return cached
 
-    serialized = serialize_layer(layer, layer_id)
+    serialized = serialize_layer(layer, layer_id, tooltip)
     _layer_cache[layer] = serialized
     if layer not in _observed_layers:
         layer.observe(_evict_cache_on_trait_change, names=traitlets.All)
         _observed_layers[layer] = None
+
+    for ext in getattr(layer, "extensions", ()) or ():
+        owners = _extension_owners.setdefault(ext, WeakSet())
+        owners.add(layer)
+        if ext not in _observed_extensions:
+            ext.observe(_evict_cache_for_extension_trait_change, names=traitlets.All)
+            _observed_extensions[ext] = None
+
     return serialized
 
 
@@ -355,9 +559,7 @@ def _compress_body(body: bytes, compression: Compression) -> tuple[bytes, str | 
             return body, None
         compression = "gzip"
     if compression != "gzip":
-        raise ValueError(
-            f"st_lonboard: compression={compression!r} is not supported; use 'auto', 'gzip', or None"
-        )
+        raise ValueError(f"st_lonboard: compression={compression!r} is not supported; use 'auto', 'gzip', or None")
 
     with span("pack_payload.compress"):
         compressed = gzip.compress(body, compresslevel=6)
@@ -386,15 +588,18 @@ def pack_payload(
         layer_headers = []
         for layer in serialized_layers:
             ipc_bytes = layer.ipc_bytes
-            layer_headers.append(
-                {
-                    "id": layer.layer_id,
-                    "type": layer.layer_type,
-                    "props": layer.props,
-                    "byteOffset": body.tell(),
-                    "byteLength": len(ipc_bytes),
-                }
-            )
+            layer_header = {
+                "id": layer.layer_id,
+                "type": layer.layer_type,
+                "props": layer.props,
+                "byteOffset": body.tell(),
+                "byteLength": len(ipc_bytes),
+            }
+            if layer.extensions:
+                layer_header["extensions"] = layer.extensions
+            if layer.tooltip_columns:
+                layer_header["tooltipColumns"] = layer.tooltip_columns
+            layer_headers.append(layer_header)
             body.write(ipc_bytes)
 
         raw_body = body.getvalue()

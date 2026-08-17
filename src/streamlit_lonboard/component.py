@@ -14,8 +14,11 @@ from ._perf import perf_enabled, span
 from .serialize import (
     ACCESSOR_GEOMETRY_LAYER_TYPES,
     Compression,
+    TooltipSpec,
+    check_parameters_json_safe,
     check_payload_size,
     pack_payload,
+    serialize_controls,
     serialize_layer_cached,
 )
 
@@ -56,6 +59,11 @@ def st_lonboard(
     on_hover: bool = False,
     return_view_state: bool = False,
     compression: Compression = "auto",
+    picking_radius: int | None = None,
+    parameters: dict[str, Any] | None = None,
+    use_device_pixels: bool | float | None = None,
+    custom_attribution: str | list[str] | None = None,
+    tooltip: bool | list[str] = False,
     key: str | None = None,
 ) -> StLonboardResult:
     """Render lonboard layers in Streamlit using Arrow end to end (no GeoJSON).
@@ -88,6 +96,32 @@ def st_lonboard(
       threshold exists instead of always compressing.
     - `"gzip"`: always compress, regardless of size.
     - `None`: never compress.
+
+    `picking_radius`, `parameters`, `use_device_pixels`, and `custom_attribution`
+    each default to `None`, which means "use the passed `map`'s own value"
+    (`lonboard.Map.picking_radius` etc.) - pass an explicit value to override
+    it, or omit both a `map` and these to get lonboard's own defaults (5,
+    `None`, `None`, `""` respectively).
+
+    `map.controls` (default: a fullscreen button, zoom/compass buttons, and a
+    scale bar - lonboard's own default) is always forwarded; there is no
+    separate `controls=` parameter, since controls only make sense attached to
+    a `Map`. `GeocoderControl` isn't supported (it needs a Python-side async
+    handler wired over lonboard's ipywidgets comm channel, which Streamlit has
+    no equivalent for) and is skipped with a warning if present.
+
+    `selected_index` / `selected_bounds` (lonboard's own click/box-select
+    output traits) aren't forwarded - use `StLonboardResult.clicked` instead.
+
+    `tooltip` controls the hover tooltip: `False` (default) shows none;
+    `True` shows every non-geometry column of each layer's own data (falls
+    back to the passed `map`'s `show_tooltip` when left at `False`); a list of
+    column names shows only those (per layer - a name absent from a
+    particular layer's data is silently skipped, since this one setting
+    applies to every layer passed to this call). Requires `pickable=True` on
+    the layer (lonboard's own default). Shipping `True` on a layer with many
+    attribute columns adds that data to the payload on every rerun - prefer
+    an explicit column list for anything beyond a quick look.
     """
     with span("st_lonboard.total"):
         if map is not None and layers is not None:
@@ -102,9 +136,7 @@ def st_lonboard(
                 view_state["longitude"] == 0
                 and view_state["latitude"] == 0
                 and view_state["zoom"] == 0
-                and any(
-                    layer._layer_type in ACCESSOR_GEOMETRY_LAYER_TYPES for layer in map.layers
-                )
+                and any(layer._layer_type in ACCESSOR_GEOMETRY_LAYER_TYPES for layer in map.layers)
             ):
                 st.warning(
                     "st_lonboard: couldn't compute a default view state (H3/S2/A5/"
@@ -115,22 +147,59 @@ def st_lonboard(
         if basemap_style == CartoStyle.PositronNoLabels and map.basemap is not None:
             basemap_style = str(map.basemap.style)
 
+        # `None` means "inherit from `map`" for all four - `map` always has a
+        # concrete value by this point (lonboard's own defaults, if the caller
+        # built it via `Map(layers=...)` above rather than passing one directly).
+        if picking_radius is None:
+            picking_radius = map.picking_radius
+        if parameters is None:
+            parameters = map.parameters
+        if use_device_pixels is None:
+            use_device_pixels = map.use_device_pixels
+        if custom_attribution is None:
+            custom_attribution = map.custom_attribution
+        check_parameters_json_safe(parameters)
+
+        if tooltip is False and map.show_tooltip:
+            tooltip = True
+        tooltip_spec: TooltipSpec = tooltip if isinstance(tooltip, bool) else tuple(tooltip)
+
         with span("serialize_layers"):
             serialized = [
-                serialize_layer_cached(layer, f"layer-{i}") for i, layer in enumerate(map.layers)
+                serialize_layer_cached(layer, f"layer-{i}", tooltip_spec) for i, layer in enumerate(map.layers)
             ]
+
+        map_options: dict[str, Any] = {
+            "basemapStyle": str(basemap_style),
+            "height": height,
+            "onClick": on_click,
+            "onHover": on_hover,
+            "returnViewState": return_view_state,
+            "perf": perf_enabled(),
+            # `picking_radius` always has a concrete value by now (lonboard's
+            # own `Map.picking_radius` defaults to 5, never `None`), unlike
+            # the fields below - keep it unconditional for that reason.
+            "pickingRadius": picking_radius,
+        }
+        # Omitted when left at lonboard's own "unset" default, matching how
+        # `extensions` is omitted per-layer when empty (serialize.py) - keeps
+        # the common case's payload minimal. `custom_attribution`'s "unset" is
+        # `""` (lonboard.Map.custom_attribution's actual default), not `None`
+        # - a truthiness check catches both that and an explicit `None`.
+        if use_device_pixels is not None:
+            map_options["useDevicePixels"] = use_device_pixels
+        if parameters is not None:
+            map_options["parameters"] = parameters
+        if custom_attribution:
+            map_options["customAttribution"] = custom_attribution
+        controls = serialize_controls(map.controls)
+        if controls:
+            map_options["controls"] = controls
 
         payload = pack_payload(
             serialized,
             view_state=view_state,
-            map_options={
-                "basemapStyle": str(basemap_style),
-                "height": height,
-                "onClick": on_click,
-                "onHover": on_hover,
-                "returnViewState": return_view_state,
-                "perf": perf_enabled(),
-            },
+            map_options=map_options,
             compression=compression,
         )
         check_payload_size(payload, max_mb=st.get_option("server.maxMessageSize"))

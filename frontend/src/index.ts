@@ -12,9 +12,10 @@
 
 import type { Layer, PickingInfo } from "@deck.gl/core";
 import { MapboxOverlay } from "@deck.gl/mapbox";
+import type { Table } from "apache-arrow";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { type ContainerHeader, type MapOptions, parseContainer } from "./container";
+import { type ContainerHeader, type ControlHeader, type MapOptions, parseContainer } from "./container";
 import { buildDeckLayers, type SubLayerInfo } from "./layers";
 
 interface ComponentApi {
@@ -28,15 +29,23 @@ interface ComponentApi {
 
 /**
  * What a `buildDeckLayers` call produced for one lonboard layer, kept around
- * so an unchanged rerun (fingerprint match, see container.ts) can be
- * answered without re-parsing or reconstructing anything - see Phase 4b in
- * IMPLEMENTATION_PLAN.md. Note the common "nothing at all changed" case
- * already costs ~0 without this (CCv2 skips calling `mount()` entirely then,
- * confirmed in Phase 4.0) - this cache only matters when *some* layers
- * changed and others didn't within a single `mount()` invocation.
+ * so a rerun where nothing changed (both fingerprints match, see
+ * container.ts) can be answered without re-parsing or reconstructing
+ * anything - see Phase 4b in IMPLEMENTATION_PLAN.md. Note the common
+ * "nothing at all changed" case already costs ~0 without this (CCv2 skips
+ * calling `mount()` entirely then, confirmed in Phase 4.0) - this cache only
+ * matters when *some* layers changed and others didn't within a single
+ * `mount()` invocation.
+ *
+ * `table` is retained (not just the built `deckLayers`) so that a rerun
+ * where only `headerFingerprint` changed - e.g. a slider-driven prop, with
+ * the Arrow bytes byte-identical - can rebuild deck.gl layers from the
+ * already-parsed table instead of needing `tableFromIPC` again.
  */
 interface LayerCacheEntry {
-  fingerprint: string;
+  bytesFingerprint: string;
+  headerFingerprint: string;
+  table: Table;
   deckLayers: Layer[];
   subLayerEntries: [string, SubLayerInfo][];
 }
@@ -59,6 +68,22 @@ interface MountState {
   lastBasemapStyle?: string;
   hoverThrottle?: ReturnType<typeof setTimeout>;
   viewStateThrottle?: ReturnType<typeof setTimeout>;
+  /** Present only while `mapOptions.customAttribution` is set - maplibre-gl has no "update attribution" API, so a change means remove-and-recreate. */
+  attributionControl?: maplibregl.AttributionControl;
+  lastCustomAttributionJson?: string;
+  /** Every control built from `mapOptions.controls` (NOT including the deck.gl overlay itself), so a rerun can remove-and-rebuild them on change. */
+  mapControls: maplibregl.IControl[];
+  lastControlsJson?: string;
+  /**
+   * lonboard layer id -> tooltip column names, rebuilt fresh from
+   * `header.layers` on every `mount()` call (cheap - no fingerprint gating
+   * needed). Read by `getTooltip`, a callback set once at `MapboxOverlay`
+   * construction and invoked by deck.gl's own hover handling *between*
+   * `mount()` calls - it must read this off `state` (updated in place) rather
+   * than close over a single `header`, or it would keep answering with
+   * whatever tooltip columns were configured at the very first mount.
+   */
+  layerTooltipColumns: Map<string, string[]>;
 }
 
 const MOUNT_KEY = "__stLonboardMount";
@@ -83,6 +108,136 @@ function logPerfSummary(): void {
   }
   performance.clearMarks();
   performance.clearMeasures();
+}
+
+/**
+ * Instantiates the maplibre-gl control matching one `lonboard.Map.controls`
+ * entry. Unrecognized types are skipped (with a warning) rather than thrown -
+ * `serialize_controls` already filters these Python-side, so this only fires
+ * on a frontend/Python version mismatch; mirrors `buildDeckLayers`/
+ * `buildLayerExtensions`'s "skip the one broken thing, keep the map usable"
+ * handling of an unsupported type.
+ *
+ * Every field below gets an explicit `?? <maplibre's own documented default>`
+ * fallback rather than passing a possibly-`undefined` value straight through.
+ * This matters: `ScaleControl`'s constructor merges options via
+ * `{...defaultOptions, ...options}` and `NavigationControl`'s via a `for...in`
+ * copy (`extend()`, in maplibre-gl's util) - both treat an explicit
+ * `key: undefined` as "present," clobbering the default with `undefined`
+ * rather than leaving it alone (confirmed against maplibre-gl's own source,
+ * and against a live map: leaving this unfallback'd silently produced a
+ * `NavigationControl` with *no* zoom buttons, since an absent `show_zoom` on
+ * the Python side arrives here as `options.showZoom === undefined`, which
+ * then overwrote the constructor's own `showZoom: true` default).
+ */
+function buildMaplibreControl(header: ControlHeader): maplibregl.IControl | null {
+  const options = header.options;
+  switch (header.type) {
+    case "scale":
+      return new maplibregl.ScaleControl({
+        maxWidth: (options.maxWidth as number | undefined) ?? 100,
+        unit: (options.unit as maplibregl.Unit | undefined) ?? "metric",
+      });
+    case "navigation":
+      // `visualizeRoll` (a lonboard NavigationControl trait) has no
+      // equivalent in the maplibre-gl version this project currently pins
+      // (^4.7.1 - NavigationControlOptions there has no such field) - not
+      // forwarded. A future maplibre-gl upgrade would pick it up once added
+      // here; until then it's silently a no-op rather than an error, since
+      // every *other* navigation option still works fine without it.
+      return new maplibregl.NavigationControl({
+        showCompass: (options.showCompass as boolean | undefined) ?? true,
+        showZoom: (options.showZoom as boolean | undefined) ?? true,
+        visualizePitch: (options.visualizePitch as boolean | undefined) ?? false,
+      });
+    case "fullscreen":
+      return new maplibregl.FullscreenControl();
+    default:
+      console.warn(`streamlit-lonboard: unsupported map control "${header.type}"`);
+      return null;
+  }
+}
+
+/** Replaces every non-overlay control on the map with a fresh set built from `controlHeaders`. */
+function applyControls(state: MountState, controlHeaders: ControlHeader[] | undefined): void {
+  for (const ctrl of state.mapControls) {
+    state.map.removeControl(ctrl);
+  }
+  state.mapControls = [];
+  for (const controlHeader of controlHeaders ?? []) {
+    const ctrl = buildMaplibreControl(controlHeader);
+    if (!ctrl) continue;
+    state.map.addControl(ctrl, controlHeader.position ?? undefined);
+    state.mapControls.push(ctrl);
+  }
+}
+
+/**
+ * maplibre-gl has no way to update an existing `AttributionControl`'s
+ * `customAttribution` in place, so a change means removing the old instance
+ * (if any) and adding a new one (if `customAttribution` is now set).
+ */
+function applyAttribution(state: MountState, customAttribution: string | string[] | undefined): void {
+  if (state.attributionControl) {
+    state.map.removeControl(state.attributionControl);
+    state.attributionControl = undefined;
+  }
+  if (customAttribution !== undefined) {
+    state.attributionControl = new maplibregl.AttributionControl({ customAttribution });
+    state.map.addControl(state.attributionControl);
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** Renders one tooltip column's Arrow-decoded value as display text. */
+function formatTooltipValue(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "object") {
+    // A struct/list-typed tooltip column (uncommon, but not disallowed) -
+    // JSON-stringify rather than showing "[object Object]".
+    try {
+      return JSON.stringify(value, (_key, v) => (typeof v === "bigint" ? v.toString() : v));
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+/**
+ * Builds hover-tooltip HTML for a pick, or `null` for "no tooltip" (nothing
+ * picked, or the picked layer has no `tooltipColumns`). `TooltipWidget` (the
+ * consumer of this return value - see @deck.gl/core's tooltip-widget.js)
+ * sets `el.innerHTML` directly from the `html` field, so every value is
+ * HTML-escaped here - tooltip columns are arbitrary user data, which must
+ * never be interpolated into innerHTML unescaped.
+ */
+function buildTooltipContent(state: MountState, info: PickingInfo): { html: string } | null {
+  if (!info.picked || !info.object || !info.layer) return null;
+
+  const subLayerInfo = state.subLayerLookup.get(info.layer.id);
+  const lonboardLayerId = subLayerInfo?.lonboardLayerId ?? info.layer.id;
+  const columns = state.layerTooltipColumns.get(lonboardLayerId);
+  if (!columns || columns.length === 0) return null;
+
+  // `info.object` is an apache-arrow `StructRowProxy` for this row (see
+  // @geoarrow/deck.gl-geoarrow's getPickingInfo, which does `batch.get(index)`
+  // on a RecordBatch that includes geometry, accessor, *and* tooltip columns)
+  // - each tooltip column name is a valid property to read off it directly.
+  const row = info.object as Record<string, unknown>;
+  const rows = columns
+    .map((col) => `<div>${escapeHtml(col)}: ${escapeHtml(formatTooltipValue(row[col]))}</div>`)
+    .join("");
+  return { html: rows };
 }
 
 function pickPayload(subLayerLookup: Map<string, SubLayerInfo>, info: PickingInfo | null) {
@@ -120,11 +275,17 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
     subLayerLookup: new Map<string, SubLayerInfo>(),
     layerCache: new Map<string, LayerCacheEntry>(),
     mapOptions: header.mapOptions,
+    mapControls: [],
+    layerTooltipColumns: new Map<string, string[]>(),
   };
 
   const overlay = new MapboxOverlay({
     interleaved: false,
     layers: [],
+    pickingRadius: header.mapOptions.pickingRadius,
+    parameters: header.mapOptions.parameters,
+    useDevicePixels: header.mapOptions.useDevicePixels,
+    getTooltip: (info: PickingInfo) => buildTooltipContent(state, info),
     onClick: (info: PickingInfo) => {
       if (!state.mapOptions.onClick) return;
       component.setTriggerValue("clicked", pickPayload(state.subLayerLookup, info));
@@ -176,10 +337,10 @@ export default async function mount(component: ComponentApi): Promise<() => void
   // parseContainer can skip tableFromIPC for layers whose bytes haven't
   // changed since last time (see container.ts).
   const existingState = component.parentElement[MOUNT_KEY] as MountState | undefined;
-  const previousFingerprints = new Map<string, string>();
+  const previousBytesFingerprints = new Map<string, string>();
   if (existingState) {
     for (const [layerId, entry] of existingState.layerCache) {
-      previousFingerprints.set(layerId, entry.fingerprint);
+      previousBytesFingerprints.set(layerId, entry.bytesFingerprint);
     }
   }
 
@@ -188,7 +349,7 @@ export default async function mount(component: ComponentApi): Promise<() => void
   // browser's native (Promise-based) DecompressionStream before it can be
   // sliced into per-layer Arrow IPC ranges. CCv2 awaits this default export,
   // so an async mount() is supported (confirmed against the bundled runtime).
-  const { header, layers } = await parseContainer(bytes, previousFingerprints);
+  const { header, layers } = await parseContainer(bytes, previousBytesFingerprints);
   const state = existingState ?? createMount(component, header);
   state.mapOptions = header.mapOptions;
 
@@ -196,30 +357,60 @@ export default async function mount(component: ComponentApi): Promise<() => void
   const deckLayers: Layer[] = [];
   const newLayerCache = new Map<string, LayerCacheEntry>();
 
-  for (const parsedLayer of layers) {
-    const { header: layerHeader, fingerprint } = parsedLayer;
+  // Rebuilt fresh every call (cheap - no need to gate this on either
+  // fingerprint, unlike deck.gl layer construction below) so `getTooltip`
+  // (invoked by deck.gl between mount() calls, on hover) always answers with
+  // this rerun's tooltip configuration.
+  state.layerTooltipColumns = new Map(
+    header.layers
+      .filter((layerHeader) => layerHeader.tooltipColumns && layerHeader.tooltipColumns.length > 0)
+      .map((layerHeader) => [layerHeader.id, layerHeader.tooltipColumns as string[]]),
+  );
 
-    if (parsedLayer.status === "unchanged") {
-      const cached = state.layerCache.get(layerHeader.id);
+  for (const parsedLayer of layers) {
+    const { header: layerHeader, bytesFingerprint, headerFingerprint, table: freshTable } = parsedLayer;
+    const cached = state.layerCache.get(layerHeader.id);
+
+    if (freshTable === undefined) {
       if (!cached) {
-        // Can't happen: "unchanged" is only returned when previousFingerprints
-        // (built from state.layerCache just above) already had this id+fingerprint.
+        // Can't happen: parseContainer only omits `table` when
+        // previousBytesFingerprints (built from state.layerCache just above)
+        // already had this id+fingerprint.
         throw new Error(
-          `streamlit-lonboard: internal error - layer ${layerHeader.id} reported unchanged ` +
-            "but has no cached build to reuse",
+          `streamlit-lonboard: internal error - layer ${layerHeader.id} reported unchanged bytes ` +
+            "but has no cached table to reuse",
         );
       }
-      for (const [subId, info] of cached.subLayerEntries) {
-        state.subLayerLookup.set(subId, info);
+      if (cached.headerFingerprint === headerFingerprint) {
+        // Bytes AND props all unchanged - reuse the built deck.gl layers
+        // verbatim, skipping buildDeckLayers entirely.
+        for (const [subId, info] of cached.subLayerEntries) {
+          state.subLayerLookup.set(subId, info);
+        }
+        deckLayers.push(...cached.deckLayers);
+        newLayerCache.set(layerHeader.id, cached);
+        continue;
       }
-      deckLayers.push(...cached.deckLayers);
-      newLayerCache.set(layerHeader.id, cached);
-      continue;
+    }
+
+    // Either the Arrow bytes changed (freshTable is the newly-parsed table)
+    // or only the header (props) changed - reuse the cached table in that
+    // case. Either way we need to rebuild the deck.gl layers, but only a
+    // fresh `tableFromIPC` is the expensive part, and that already happened
+    // (or was skipped) in parseContainer.
+    const table = freshTable ?? cached?.table;
+    if (!table) {
+      // Can't happen: cached is only missing when freshTable is defined (see
+      // the throw above), so this branch always has one or the other.
+      throw new Error(
+        `streamlit-lonboard: internal error - layer ${layerHeader.id} has neither a freshly ` +
+          "parsed nor a cached table",
+      );
     }
 
     let built: Layer[];
     try {
-      built = buildDeckLayers(layerHeader, parsedLayer.table, state.subLayerLookup);
+      built = buildDeckLayers(layerHeader, table, state.subLayerLookup);
     } catch (error) {
       // One bad layer (e.g. a props/data mismatch) shouldn't take down every
       // other layer on the map via the BidiComponent error boundary - log and
@@ -235,12 +426,23 @@ export default async function mount(component: ComponentApi): Promise<() => void
       ([, info]) => info.lonboardLayerId === layerHeader.id,
     );
     deckLayers.push(...built);
-    newLayerCache.set(layerHeader.id, { fingerprint, deckLayers: built, subLayerEntries });
+    newLayerCache.set(layerHeader.id, {
+      bytesFingerprint,
+      headerFingerprint,
+      table,
+      deckLayers: built,
+      subLayerEntries,
+    });
   }
   state.layerCache = newLayerCache;
 
   performance.mark("st-lonboard:setProps:start");
-  state.overlay.setProps({ layers: deckLayers });
+  state.overlay.setProps({
+    layers: deckLayers,
+    pickingRadius: header.mapOptions.pickingRadius,
+    parameters: header.mapOptions.parameters,
+    useDevicePixels: header.mapOptions.useDevicePixels,
+  });
   performance.mark("st-lonboard:setProps:end");
   performance.measure("st-lonboard:setProps", "st-lonboard:setProps:start", "st-lonboard:setProps:end");
 
@@ -254,6 +456,22 @@ export default async function mount(component: ComponentApi): Promise<() => void
   if (state.container.style.height !== `${height}px`) {
     state.container.style.height = `${height}px`;
     state.map.resize();
+  }
+
+  // maplibre-gl has no in-place "update" for either of these, so both are
+  // fully rebuilt on change - cheap (a handful of DOM nodes), and `state.lastX`
+  // starts `undefined` on a fresh mount, so this same block also performs the
+  // *initial* build (no separate seeding needed in createMount).
+  const customAttributionJson = JSON.stringify(header.mapOptions.customAttribution ?? null);
+  if (customAttributionJson !== state.lastCustomAttributionJson) {
+    applyAttribution(state, header.mapOptions.customAttribution);
+    state.lastCustomAttributionJson = customAttributionJson;
+  }
+
+  const controlsJson = JSON.stringify(header.mapOptions.controls ?? []);
+  if (controlsJson !== state.lastControlsJson) {
+    applyControls(state, header.mapOptions.controls);
+    state.lastControlsJson = controlsJson;
   }
 
   performance.mark("st-lonboard:mount:end");
