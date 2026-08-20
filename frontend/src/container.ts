@@ -6,17 +6,45 @@
  * CCv2's automatic dataframe-in-dict serialization.
  */
 
-import { tableFromIPC, type Table } from "apache-arrow";
+import { compressionRegistry, CompressionType, tableFromIPC, type Table } from "apache-arrow";
+import { decompress as zstdDecompress } from "fzstd";
 import type { ExtensionHeader } from "./extensions";
 import { fnv1a, fnv1aString } from "./fingerprint";
+import { parquetToIPC } from "./parquet";
 
 // Bump in lockstep with streamlit_lonboard.serialize.PAYLOAD_FORMAT_VERSION.
 const SUPPORTED_PAYLOAD_FORMAT_VERSION = 1;
+
+// Lets `tableFromIPC` transparently read the ZSTD-compressed record-batch
+// buffers produced by `st_lonboard(compression="zstd")` (the IPC spec's
+// per-buffer body compression - arrow-js strips each buffer's 8-byte
+// uncompressed-length prefix itself and hands the codec raw ZSTD frames).
+// Registered unconditionally at module load: fzstd is a ~8KB pure-JS
+// decoder, and an uncompressed stream never consults the registry.
+compressionRegistry.set(CompressionType.ZSTD, {
+  decode(data: Uint8Array): Uint8Array {
+    const out = zstdDecompress(data);
+    // fzstd returns views into an internal buffer at arbitrary byteOffset;
+    // arrow-js wraps the returned chunk in typed arrays directly
+    // (Float64Array etc.), which require 8-byte alignment - slice() copies
+    // to a fresh, offset-0 buffer when needed.
+    return out.byteOffset % 8 === 0 ? out : out.slice();
+  },
+});
 
 export interface LayerHeader {
   id: string;
   type: string;
   props: Record<string, unknown>;
+  /**
+   * How this layer's byte range in the body is encoded - see
+   * `streamlit_lonboard.serialize.BodyEncoding`. Absent means "ipc". It is
+   * per-layer, not per-payload, because `compression="auto"` resolves
+   * against each layer's own size, so one map can mix encodings.
+   * "ipc-zstd" needs no handling beyond the codec registered above;
+   * "parquet" routes the bytes through parquet-wasm first.
+   */
+  bodyEncoding?: "ipc" | "ipc-zstd" | "parquet";
   /** Layer extensions attached to this lonboard layer, e.g. `PathStyleExtension`. Omitted when none. */
   extensions?: ExtensionHeader[];
   /** Column names appended to this layer's Arrow table for hover tooltips (see `st_lonboard(tooltip=...)`). Omitted when none. */
@@ -146,7 +174,9 @@ export async function parseContainer(
   bytes: Uint8Array,
   previousBytesFingerprints: ReadonlyMap<string, string> = new Map(),
 ): Promise<ParsedContainer> {
-  performance.mark("st-lonboard:parseContainer:start");
+  // Timestamp-based like every other measure spanning an `await` here - see
+  // the decompress measure below for why named marks are unsafe in this file.
+  const parseStart = performance.now();
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const headerLen = view.getUint32(0, true);
   const headerJson = new TextDecoder().decode(bytes.subarray(4, 4 + headerLen));
@@ -162,28 +192,48 @@ export async function parseContainer(
 
   let body = rawBody;
   if (header.compression === "gzip") {
-    performance.mark("st-lonboard:decompress:start");
+    // Timestamp-based measure (not named marks): this span crosses an
+    // `await`, during which another concurrently-mounting map instance may
+    // call `logPerfSummary()` -> `performance.clearMarks()` and wipe a
+    // start mark out from under us (global `performance` state is shared
+    // across every component instance on the page).
+    const start = performance.now();
     body = await decompressGzip(rawBody);
-    performance.mark("st-lonboard:decompress:end");
-    performance.measure(
-      "st-lonboard:decompress",
-      "st-lonboard:decompress:start",
-      "st-lonboard:decompress:end",
-    );
+    performance.measure("st-lonboard:decompress", { start, end: performance.now() });
   }
 
-  const layers: ParsedLayer[] = header.layers.map((layerHeader) => {
-    const ipcBytes = body.subarray(
+  const layers: ParsedLayer[] = [];
+  for (const layerHeader of header.layers) {
+    const bodyEncoding = layerHeader.bodyEncoding ?? "ipc";
+    // For "parquet" these are Parquet file bytes, not an IPC stream - the
+    // fingerprint is over the *wire* bytes either way, so the byte-identical
+    // skip below works for every encoding.
+    const bodyBytes = body.subarray(
       layerHeader.byteOffset,
       layerHeader.byteOffset + layerHeader.byteLength,
     );
-    const bytesFingerprint = fnv1a(ipcBytes);
+    const bytesFingerprint = fnv1a(bodyBytes);
     const headerFingerprint = fnv1aString(JSON.stringify(headerFingerprintPayload(layerHeader)));
 
     if (previousBytesFingerprints.get(layerHeader.id) === bytesFingerprint) {
-      return { header: layerHeader, bytesFingerprint, headerFingerprint };
+      layers.push({ header: layerHeader, bytesFingerprint, headerFingerprint });
+      continue;
     }
 
+    let ipcBytes = bodyBytes;
+    if (bodyEncoding === "parquet") {
+      // Timestamp-based for the same reason as the decompress measure above
+      // (the WASM init this may await is exactly when other instances run).
+      const start = performance.now();
+      ipcBytes = await parquetToIPC(bodyBytes);
+      performance.measure(`st-lonboard:parquetDecode[${layerHeader.id}]`, {
+        start,
+        end: performance.now(),
+      });
+    }
+
+    // For "ipc-zstd", per-buffer ZSTD decompression happens inside this call
+    // (via the codec registered above) - its cost shows up in this measure.
     performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:start`);
     const table = tableFromIPC(ipcBytes);
     performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:end`);
@@ -192,15 +242,10 @@ export async function parseContainer(
       `st-lonboard:tableFromIPC[${layerHeader.id}]:start`,
       `st-lonboard:tableFromIPC[${layerHeader.id}]:end`,
     );
-    return { header: layerHeader, bytesFingerprint, headerFingerprint, table };
-  });
+    layers.push({ header: layerHeader, bytesFingerprint, headerFingerprint, table });
+  }
 
-  performance.mark("st-lonboard:parseContainer:end");
-  performance.measure(
-    "st-lonboard:parseContainer",
-    "st-lonboard:parseContainer:start",
-    "st-lonboard:parseContainer:end",
-  );
+  performance.measure("st-lonboard:parseContainer", { start: parseStart, end: performance.now() });
 
   return { header, layers };
 }

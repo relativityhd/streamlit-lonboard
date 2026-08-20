@@ -60,8 +60,9 @@ dev = ["pytest>=8", "geopandas>=1", "ruff>=0.15,<0.16"]
 # Only for benchmarks/ (Phase 4c contender comparison) - not needed to use
 # streamlit-lonboard itself. pydeck ships bundled with streamlit already;
 # listed explicitly here since benchmarks/contenders/pydeck_app.py imports it
-# directly. playwright drives the headless timing measurements.
-bench = ["pydeck", "playwright"]
+# directly. playwright drives the headless timing measurements, and zarr
+# reads the real-data scenarios in benchmarks/real_scenarios.py.
+bench = ["pydeck", "playwright", "zarr>=3"]
 
 [project.urls]
 Homepage = "https://github.com/relativityhd/streamlit-lonboard"

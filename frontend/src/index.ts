@@ -337,7 +337,10 @@ function createMount(component: ComponentApi, header: ContainerHeader): MountSta
 }
 
 export default async function mount(component: ComponentApi): Promise<() => void> {
-  performance.mark("st-lonboard:mount:start");
+  // Timestamp-based (not named marks): mount() spans awaits (gzip
+  // decompression, parquet-wasm init), during which another component
+  // instance's logPerfSummary() may clearMarks() - see container.ts.
+  const mountStart = performance.now();
 
   const bytes = toUint8Array(component.data);
 
@@ -496,8 +499,7 @@ export default async function mount(component: ComponentApi): Promise<() => void
     state.lastControlsJson = controlsJson;
   }
 
-  performance.mark("st-lonboard:mount:end");
-  performance.measure("st-lonboard:mount", "st-lonboard:mount:start", "st-lonboard:mount:end");
+  performance.measure("st-lonboard:mount", { start: mountStart, end: performance.now() });
   if (header.mapOptions.perf) {
     logPerfSummary();
   }

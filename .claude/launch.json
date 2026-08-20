@@ -83,6 +83,15 @@
       "port": 8501
     },
     {
+      "name": "wire-verify",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "exec env PYTHONFAULTHANDLER=1 uv run streamlit run benchmarks/wire_verify_app.py --server.headless true --server.port 8599"
+      ],
+      "port": 8599
+    },
+    {
       "name": "contender-tohtml",
       "runtimeExecutable": "bash",
       "runtimeArgs": [

@@ -21,6 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `st_lonboard(compression=...)` gained two wire formats and changed what its
+  `"auto"` default does. New options: `"zstd"` (Arrow IPC with the IPC spec's
+  own per-buffer ZSTD compression, decompressed transparently during Arrow
+  parsing - no extra frontend downloads) and `"parquet"` (each layer shipped
+  as a ZSTD + BYTE_STREAM_SPLIT Parquet file, decoded by parquet-wasm - a
+  one-time ~1.8MB gzipped WASM download, then browser-cached). `"auto"` now
+  resolves *per layer*: layers under 1MB ship as plain Arrow IPC exactly as
+  before (byte-identical payloads, and no WASM fetch), larger ones ship as
+  Parquet instead of the whole-body gzip it used to apply. On real data this
+  cuts a 12.6MB payload to 2.1MB for ~48ms of Python and ~67ms of browser
+  decode; `"gzip"` remains available but is superseded on every axis except
+  decode speed. See `benchmarks/RESULTS.md` (Phases 4h-4j) for the
+  measurements, including why BYTE_STREAM_SPLIT is applied only to flat and
+  point-like numeric columns and not to nested polygon coordinates.
 - Reruns that change only per-row accessor columns (colours, radii, widths) no
   longer re-tessellate. The frontend fingerprints each Arrow column's contents
   after parsing and tags each record batch with the fingerprint of its

@@ -107,7 +107,7 @@ def test_serialized_output_is_identical_with_and_without_the_patch(points_gdf):
     widget_patch.apply_widget_comm_patch()
     patched = serialize.serialize_layer(_scatterplot(points_gdf), "layer-0")
 
-    assert patched.ipc_bytes == unpatched.ipc_bytes
+    assert patched.body_bytes == unpatched.body_bytes
     assert patched.props == unpatched.props
     assert patched.layer_type == unpatched.layer_type
 

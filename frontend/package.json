@@ -4,8 +4,9 @@
   "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "dev": "vite build --watch",
-    "build": "vite build"
+    "dev": "npm run copy-wasm && vite build --watch",
+    "build": "vite build && npm run copy-wasm",
+    "copy-wasm": "cp node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm ../src/streamlit_lonboard/frontend_dist/"
   },
   "dependencies": {
     "@deck.gl/aggregation-layers": "^9.3.6",
@@ -16,8 +17,10 @@
     "@deck.gl/mapbox": "^9.3.6",
     "@geoarrow/deck.gl-geoarrow": "^0.4.1",
     "@math.gl/polygon": "^4.1.0",
-    "apache-arrow": "^17.0.0",
-    "maplibre-gl": "^4.7.1"
+    "apache-arrow": "^21.2.0",
+    "fzstd": "^0.1.1",
+    "maplibre-gl": "^4.7.1",
+    "parquet-wasm": "^0.7.2"
   },
   "devDependencies": {
     "rollup-plugin-license": "^3.7.1",

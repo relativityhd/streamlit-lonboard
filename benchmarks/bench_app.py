@@ -1,7 +1,7 @@
 """Phase 4.0/4d baseline benchmark app: N-point scatterplot, perf spans on.
 
 Usage: BENCH_N=1000000 ST_LONBOARD_PERF=1 streamlit run benchmarks/bench_app.py
-Add BENCH_COMPRESSION=gzip|none to force a compression mode (default: "auto",
+Add BENCH_COMPRESSION=gzip|zstd|parquet|none to force a compression mode (default: "auto",
 st_lonboard()'s own default). Add BENCH_CLUSTERED=1 for clustered (not
 uniform-random) points - see the note below on why that changes gzip ratios.
 

@@ -156,7 +156,7 @@ def test_serialize_layer_cached_misses_on_different_object(points_gdf):
     second = serialize.serialize_layer_cached(layer_b, "layer-0")
 
     assert first is not second
-    assert first.ipc_bytes == second.ipc_bytes  # same content, just not cached across objects
+    assert first.body_bytes == second.body_bytes  # same content, just not cached across objects
 
 
 def test_serialize_layer_cached_misses_on_different_layer_id(points_gdf):
@@ -198,48 +198,73 @@ def _unpack(blob: bytes) -> tuple[dict, bytes]:
 
 def test_pack_payload_compression_none_never_compresses(points_gdf):
     layer = ScatterplotLayer.from_geopandas(_large_points_gdf(), get_fill_color=[255, 0, 0])
-    serialized = serialize.serialize_layer(layer, "layer-0")
+    serialized = serialize.serialize_layer(layer, "layer-0", encoding="ipc")
 
     blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression=None)
 
     header, body = _unpack(blob)
     assert header["compression"] is None
-    assert len(body) == len(serialized.ipc_bytes)
+    assert len(body) == len(serialized.body_bytes)
 
 
 def test_pack_payload_compression_gzip_always_compresses_even_when_tiny(points_gdf):
     layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
-    serialized = serialize.serialize_layer(layer, "layer-0")
+    serialized = serialize.serialize_layer(layer, "layer-0", encoding="ipc")
 
     blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="gzip")
 
     header, body = _unpack(blob)
     assert header["compression"] == "gzip"
-    assert gzip.decompress(body) == serialized.ipc_bytes
+    assert gzip.decompress(body) == serialized.body_bytes
 
 
-def test_pack_payload_compression_auto_skips_small_payloads(points_gdf):
+def test_pack_payload_compression_auto_ships_small_layers_as_plain_ipc(points_gdf):
     layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
-    serialized = serialize.serialize_layer(layer, "layer-0")
+    serialized = serialize.serialize_layer(layer, "layer-0", encoding="auto")
+    assert serialized.encoding == "ipc"
 
     blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="auto")
 
     header, body = _unpack(blob)
     assert header["compression"] is None
-    assert body == serialized.ipc_bytes
+    # No `bodyEncoding` key at all: a small-layer "auto" payload must stay
+    # byte-identical to what the plain-IPC path has always produced (and so
+    # never triggers the parquet-wasm download in the frontend).
+    assert "bodyEncoding" not in header["layers"][0]
+    assert body == serialized.body_bytes
 
 
-def test_pack_payload_compression_auto_compresses_large_payloads():
+def test_pack_payload_compression_auto_ships_large_layers_as_parquet():
     layer = ScatterplotLayer.from_geopandas(_large_points_gdf(), get_fill_color=[255, 0, 0])
-    serialized = serialize.serialize_layer(layer, "layer-0")
-    assert len(serialized.ipc_bytes) >= serialize.AUTO_COMPRESSION_THRESHOLD
+    serialized = serialize.serialize_layer(layer, "layer-0", encoding="auto")
+    assert serialized.table.nbytes >= serialize.AUTO_COMPRESSION_THRESHOLD
+    assert serialized.encoding == "parquet"
 
     blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="auto")
 
     header, body = _unpack(blob)
-    assert header["compression"] == "gzip"
-    assert len(body) < len(serialized.ipc_bytes)
-    assert gzip.decompress(body) == serialized.ipc_bytes
+    # Compression happens inside the Parquet file, not as a whole-body pass.
+    assert header["compression"] is None
+    assert header["layers"][0]["bodyEncoding"] == "parquet"
+    assert body == serialized.body_bytes
+    assert len(body) < serialized.table.nbytes
+
+
+def test_pack_payload_compression_auto_mixes_encodings_across_layers(points_gdf):
+    """ "auto" resolves per layer, so a small and a large layer in the same
+    map legitimately travel under different encodings."""
+    small = serialize.serialize_layer(
+        ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0]), "layer-0", encoding="auto"
+    )
+    large = serialize.serialize_layer(
+        ScatterplotLayer.from_geopandas(_large_points_gdf(), get_fill_color=[255, 0, 0]), "layer-1", encoding="auto"
+    )
+
+    blob = serialize.pack_payload([small, large], view_state=None, map_options={}, compression="auto")
+
+    header, _ = _unpack(blob)
+    assert "bodyEncoding" not in header["layers"][0]
+    assert header["layers"][1]["bodyEncoding"] == "parquet"
 
 
 def test_pack_payload_compression_rejects_unknown_value(points_gdf):
@@ -275,6 +300,97 @@ def test_pack_payload_roundtrip(points_gdf):
     with pa.ipc.open_stream(ipc_bytes) as reader:
         table = reader.read_all()
     assert table.num_rows == 3
+
+
+def test_pack_payload_zstd_roundtrip(points_gdf):
+    """compression="zstd" -> per-layer Arrow IPC streams with ZSTD buffer
+    compression, no whole-body gzip, and a per-layer "bodyEncoding". The
+    stream must read back with plain pyarrow (which handles IPC buffer
+    compression natively) - byte ranges are of the *compressed* streams."""
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0", encoding="ipc-zstd")
+    assert serialized.encoding == "ipc-zstd"
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="zstd")
+
+    header, body = _unpack(blob)
+    assert header["compression"] is None
+    layer_header = header["layers"][0]
+    assert layer_header["bodyEncoding"] == "ipc-zstd"
+    ipc_bytes = body[layer_header["byteOffset"] : layer_header["byteOffset"] + layer_header["byteLength"]]
+    with pa.ipc.open_stream(ipc_bytes) as reader:
+        table = reader.read_all()
+    assert table.num_rows == 3
+    assert "geometry" in table.schema.names
+
+
+def test_pack_payload_parquet_roundtrip(points_gdf):
+    """compression="parquet" -> per-layer Parquet files. Reads back with
+    pyarrow.parquet, preserving the GeoArrow extension field metadata the
+    frontend's layer builders key on (stored via the ARROW:schema footer)."""
+    import pyarrow.parquet as pq
+
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0", encoding="parquet")
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="parquet")
+
+    header, body = _unpack(blob)
+    assert header["compression"] is None
+    layer_header = header["layers"][0]
+    assert layer_header["bodyEncoding"] == "parquet"
+    parquet_bytes = body[layer_header["byteOffset"] : layer_header["byteOffset"] + layer_header["byteLength"]]
+    table = pq.read_table(pa.BufferReader(parquet_bytes))
+    assert table.num_rows == 3
+    geometry_field = table.schema.field("geometry")
+    assert geometry_field.metadata[b"ARROW:extension:name"].startswith(b"geoarrow.")
+
+
+def test_pack_payload_ipc_encoding_omits_body_encoding_header(points_gdf):
+    """Plain-IPC payloads must stay byte-identical with what older frontend
+    builds expect - "bodyEncoding" only appears for the new encodings."""
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0", encoding="ipc")
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression=None)
+
+    header, _ = _unpack(blob)
+    assert "bodyEncoding" not in header["layers"][0]
+
+
+def test_pack_payload_rejects_encoding_mismatch(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+    serialized = serialize.serialize_layer(layer, "layer-0", encoding="ipc")
+
+    with pytest.raises(ValueError, match="serialized for encoding"):
+        serialize.pack_payload([serialized], view_state=None, map_options={}, compression="parquet")
+
+
+@pytest.mark.parametrize("encoding", ["ipc-zstd", "parquet"])
+def test_new_encodings_are_byte_deterministic(encoding):
+    """Same determinism requirement as plain IPC (see
+    test_serialize_layer_is_byte_deterministic): Streamlit's ForwardMsgCache
+    dedups on payload bytes, so ZSTD/Parquet output must be stable across
+    fresh constructions of identical content."""
+
+    def build() -> bytes:
+        gdf = gpd.GeoDataFrame(geometry=[Point(0, 0), Point(1, 1), Point(2, 2)], crs="EPSG:4326")
+        layer = ScatterplotLayer.from_geopandas(gdf, get_fill_color=[255, 0, 0])
+        return serialize.serialize_layer(layer, "layer-0", encoding=encoding).body_bytes
+
+    assert len({build() for _ in range(10)}) == 1
+
+
+def test_serialize_layer_cached_misses_on_encoding_change(points_gdf):
+    layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
+
+    first = serialize.serialize_layer_cached(layer, "layer-0", encoding="ipc")
+    second = serialize.serialize_layer_cached(layer, "layer-0", encoding="ipc-zstd")
+    third = serialize.serialize_layer_cached(layer, "layer-0", encoding="ipc-zstd")
+
+    assert first is not second
+    assert second is third
+    assert second.encoding == "ipc-zstd"
 
 
 def test_check_payload_size_passes_under_limit():
@@ -313,7 +429,7 @@ def test_serialize_layer_produces_valid_ipc_for_multi_chunk_polygon_layer():
 
     serialized = serialize.serialize_layer(layer, "layer-0")
 
-    reader = pa.ipc.open_stream(serialized.ipc_bytes)
+    reader = pa.ipc.open_stream(serialized.body_bytes)
     batches = list(reader)
     assert len(batches) == 1  # combine_chunks() collapses the rechunk before writing
     for batch in batches:
@@ -356,7 +472,10 @@ def attribute_table():
 
 
 def test_serialize_layer_h3_hexagon_ships_uint64_cells(attribute_table):
-    cells = np.array([0x8928308280FFFFF, 0x8928308280FFFFE, 0x8928308280FFFFD], dtype=np.uint64)
+    # Real resolution-9 cell IDs around San Francisco, not made-up ones: when
+    # `h3-py` is installed (the benchmarks ask for it), lonboard's default-viewport
+    # computation actually decodes these and raises on an invalid cell.
+    cells = np.array([0x8928308212FFFFF, 0x89283082EBBFFFF, 0x89283082E23FFFF], dtype=np.uint64)
     layer = H3HexagonLayer(table=attribute_table, get_hexagon=cells, get_fill_color=[255, 0, 0])
 
     serialized = serialize.serialize_layer(layer, "layer-0")
@@ -367,7 +486,7 @@ def test_serialize_layer_h3_hexagon_ships_uint64_cells(attribute_table):
     assert serialized.table.schema.field("get_hexagon").type == pa.uint64()
     assert serialized.props["getHexagon"] == {"@@arrowColumn": "get_hexagon"}
 
-    with pa.ipc.open_stream(serialized.ipc_bytes) as reader:
+    with pa.ipc.open_stream(serialized.body_bytes) as reader:
         for batch in reader:
             batch.validate(full=True)
 
@@ -646,7 +765,7 @@ def test_pack_payload_omits_extensions_key_when_none_attached(points_gdf):
     layer = ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0])
     serialized = serialize.serialize_layer(layer, "layer-0")
 
-    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression=None)
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={})
 
     header, _ = _unpack(blob)
     assert "extensions" not in header["layers"][0]
@@ -657,7 +776,7 @@ def test_pack_payload_includes_extensions_key_when_present(path_gdf):
     layer = PathLayer.from_geopandas(path_gdf, extensions=[ext], get_dash_array=[4, 2])
     serialized = serialize.serialize_layer(layer, "layer-0")
 
-    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression=None)
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={})
 
     header, _ = _unpack(blob)
     assert header["layers"][0]["extensions"] == [{"type": "path-style", "props": {"dash": True}}]
@@ -828,7 +947,7 @@ def test_pack_payload_tooltip_columns_key_present_only_when_set(tooltip_gdf):
     with_tooltip = serialize.serialize_layer(layer, "layer-0", tooltip=("name",))
     without_tooltip = serialize.serialize_layer(layer, "layer-1")
 
-    blob = serialize.pack_payload([with_tooltip, without_tooltip], view_state=None, map_options={}, compression=None)
+    blob = serialize.pack_payload([with_tooltip, without_tooltip], view_state=None, map_options={})
 
     header, _ = _unpack(blob)
     assert header["layers"][0]["tooltipColumns"] == ["name"]

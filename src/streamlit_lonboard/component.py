@@ -15,6 +15,7 @@ from .serialize import (
     ACCESSOR_GEOMETRY_LAYER_TYPES,
     Compression,
     TooltipSpec,
+    body_encoding_for,
     check_parameters_json_safe,
     check_payload_size,
     pack_payload,
@@ -88,14 +89,24 @@ def st_lonboard(
     layer types, or a degenerate `{0, 0, 0}` view will be used and a warning
     shown.
 
-    `compression` controls gzip compression of the Arrow payload:
-    - `"auto"` (default): compress only above
-      `serialize.AUTO_COMPRESSION_THRESHOLD` (1MB) of raw data. Worth it for
-      remote deployments; on localhost the extra CPU usually costs more than
-      it saves (see IMPLEMENTATION_PLAN.md §2 and Phase 4d), which is why the
-      threshold exists instead of always compressing.
-    - `"gzip"`: always compress, regardless of size.
-    - `None`: never compress.
+    `compression` controls how the Arrow payload is encoded on the wire (see
+    benchmarks/RESULTS.md Phase 4h/4i for the measurements behind these):
+    - `"auto"` (default): decided per layer against its table size. Layers
+      under `serialize.AUTO_COMPRESSION_THRESHOLD` (1MB) ship as plain,
+      near-zero-copy Arrow IPC; larger ones ship as Parquet. Below the
+      threshold the CPU isn't worth it (on localhost, transfer is free), and
+      an app whose layers all stay under it never downloads parquet-wasm.
+    - `"parquet"`: always Parquet (ZSTD + BYTE_STREAM_SPLIT), decoded back to
+      Arrow in the browser by parquet-wasm - a one-time ~1.8MB (gzipped)
+      WASM download, then browser-cached. Best measured compression ratio
+      *and* fastest compressed-mode decode.
+    - `"zstd"`: Arrow IPC with ZSTD-compressed record-batch buffers (the IPC
+      spec's own per-buffer compression). Slightly worse ratio and slower
+      decode than Parquet, but needs no WASM download at all - the better
+      pick for one-shot/public apps whose visitors never return.
+    - `"gzip"`: plain Arrow IPC, whole-body gzip. Kept for compatibility;
+      superseded by the two above on every axis except decode speed.
+    - `None`: plain Arrow IPC, never compressed. Best on localhost.
 
     `picking_radius`, `parameters`, `use_device_pixels`, and `custom_attribution`
     each default to `None`, which means "use the passed `map`'s own value"
@@ -164,9 +175,11 @@ def st_lonboard(
             tooltip = True
         tooltip_spec: TooltipSpec = tooltip if isinstance(tooltip, bool) else tuple(tooltip)
 
+        body_encoding = body_encoding_for(compression)
         with span("serialize_layers"):
             serialized = [
-                serialize_layer_cached(layer, f"layer-{i}", tooltip_spec) for i, layer in enumerate(map.layers)
+                serialize_layer_cached(layer, f"layer-{i}", tooltip_spec, body_encoding)
+                for i, layer in enumerate(map.layers)
             ]
 
         map_options: dict[str, Any] = {

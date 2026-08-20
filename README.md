@@ -143,17 +143,30 @@ below, or give one widget its comm back with
 
 ### Compression
 
-`st_lonboard(..., compression="auto" | "gzip" | None)` (default `"auto"`)
-gzips the Arrow payload above a 1MB threshold. **Measure before relying on
-this** — at 1M points it only shaved off ~11% (clustered *and* uniform-random
-data compressed about the same; gzip finds repeated byte sequences, not
-spatial/numeric proximity, so real GPS-precision coordinates don't compress
-much better than random ones) while costing ~900ms-1s of Python-side CPU plus
-~200ms of browser-side decompression per rerun — a net loss on localhost or
-any reasonably fast link, and only a likely win on slow/high-latency
-connections where the transfer savings outweigh that added CPU time. See
-[`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) for the numbers behind
-this. Pass `compression=None` to disable it outright.
+`st_lonboard(..., compression="auto" | "parquet" | "zstd" | "gzip" | None)`,
+default `"auto"`, controls how each layer's Arrow table travels to the
+browser. `"auto"` decides **per layer**: under 1MB it ships plain,
+near-zero-copy Arrow IPC; above that it ships Parquet (ZSTD +
+BYTE_STREAM_SPLIT), decoded back to Arrow by `parquet-wasm`.
+
+On real data (an Arctic EO cube on the A5 DGGS, 358k cells) that turns a
+12.6MB payload into 2.1MB — 0.17× — for ~48ms of Python and ~67ms of browser
+decode. Uniform-random synthetic coordinates compress far worse (0.79×),
+so **benchmark your own data** rather than either number.
+
+The other modes, and when to reach for them:
+
+| mode | use it when |
+| --- | --- |
+| `"auto"` (default) | almost always |
+| `"parquet"` | you want Parquet below the 1MB threshold too |
+| `"zstd"` | one-shot/public apps: slightly worse ratio and slower decode, but avoids `parquet-wasm`'s one-time ~1.8MB (gzipped, then browser-cached) download entirely |
+| `"gzip"` | compatibility only — superseded on every axis except decode speed |
+| `None` | purely local use, where transfer is free and any encode/decode is pure overhead |
+
+Apps whose layers all stay under the threshold ship byte-identical payloads
+to previous versions and never fetch the WASM. Full methodology and numbers:
+[`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) (Phases 4h–4j).
 
 ### vs. `st.pydeck_chart` and `Map.to_html()`
 
