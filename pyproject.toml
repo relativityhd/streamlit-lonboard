@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "streamlit-lonboard"
-version = "0.1.0"
+version = "0.2.0"
 description = "Streamlit component for lonboard: fast GeoArrow/deck.gl maps without GeoJSON"
 readme = "README.md"
 license = "MIT"
