@@ -58,6 +58,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reruns that change only per-row accessor columns (colours, radii, widths) no
+  longer re-tessellate. The frontend fingerprints each Arrow column's contents
+  after parsing and tags each record batch with the fingerprint of its
+  geometry-bearing columns; a `dataComparator` then lets deck.gl recognise a
+  new-but-identical geometry as unchanged, while per-column `updateTriggers`
+  re-upload exactly the accessors that differ. Measured on 160,000
+  high-precision H3 cells: a colour-only rerun drops from ~2.2s of blocked main
+  thread to 0ms, rendering pixel-identical output; on 160,000 A5 cells the
+  equivalent full rebuild costs ~9s. Genuine geometry changes still rebuild, and
+  picking/tooltips still resolve against the current data. No wire-format change
+  — the Python package and its `frontend_dist` do **not** need to be upgraded in
+  lockstep for this.
 - Importing `streamlit_lonboard` now stops lonboard's widgets from serializing
   their state for a Jupyter comm that cannot exist under Streamlit. lonboard
   layers are ipywidgets `Widget`s, and `Widget.__init__` unconditionally calls

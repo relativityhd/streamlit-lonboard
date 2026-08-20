@@ -97,6 +97,22 @@ entirely when a rerun's output is byte-for-byte unchanged (see
 10k/100k/1M points) — so the main thing left to optimize is Python-side
 re-serialization, which is exactly what the cache above avoids.
 
+### Colour-only updates
+
+Changing just a colormap — the most common dashboard interaction — used to cost
+as much as drawing the map from scratch. Streamlit re-sends the whole component
+payload whenever anything in it changes, so new colours arrived as a brand-new
+Arrow table, and deck.gl treated that as new data: every cell boundary
+re-derived, every polygon re-tessellated. At 160k DGGS cells that was seconds of
+frozen browser tab.
+
+The frontend now fingerprints each column's contents after parsing, and reuses
+the existing tessellation when the geometry-bearing columns are unchanged,
+re-uploading only the accessor columns that actually differ. Measured on 160k
+high-precision H3 cells: a recolour rerun went from **2.2s of blocked main
+thread to 0ms**, with pixel-identical output. It is automatic — no API, no flag.
+A genuine geometry change still rebuilds in full.
+
 ### Layer construction cost
 
 lonboard layers are ipywidgets `Widget`s, and `Widget.__init__` unconditionally
