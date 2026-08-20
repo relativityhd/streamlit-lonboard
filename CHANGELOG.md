@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-20
+
 ### Added
 
 - Support for lonboard's DGGS layers - `H3HexagonLayer`, `S2Layer`, `A5Layer`, and
