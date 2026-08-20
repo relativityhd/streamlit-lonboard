@@ -97,6 +97,34 @@ entirely when a rerun's output is byte-for-byte unchanged (see
 10k/100k/1M points) — so the main thing left to optimize is Python-side
 re-serialization, which is exactly what the cache above avoids.
 
+### Layer construction cost
+
+lonboard layers are ipywidgets `Widget`s, and `Widget.__init__` unconditionally
+opens a Jupyter comm — which serializes the entire table and every accessor
+column to Parquet to fill a comm-open message. Under Streamlit there is no
+kernel, so that message goes straight into a dummy comm and is discarded.
+
+Importing `streamlit_lonboard` therefore patches lonboard's two widget base
+classes so this work is skipped (measured: `A5Layer` at 200k rows drops from
+62ms to 0.6ms; a `ScatterplotLayer.from_geopandas` at 200k, where the
+GeoDataFrame → Arrow conversion is real work, roughly halves). What
+`st_lonboard()` puts on the wire is byte-for-byte identical either way — it
+reads the layer's traits and does its own Arrow IPC encoding, never touching
+lonboard's Parquet path. As a side effect, layers no longer accumulate in
+ipywidgets' global `_instances` registry, which nothing drains under Streamlit.
+
+The trade-off: patched widgets have `widget.comm is None` and no `model_id`, so
+`Map.to_html()` / `Map.as_html()` raise. Either set the environment variable
+below, or give one widget its comm back with
+`ipywidgets.Widget.open(widget)` before exporting.
+
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `STREAMLIT_LONBOARD_KEEP_WIDGET_COMM=1` | Keep stock ipywidgets behavior (see above). Must be set **before** `import streamlit_lonboard`. |
+| `ST_LONBOARD_PERF=1` | Log serialize/pack/mount timings to stderr and emit `st-lonboard:*` marks in the browser's performance timeline. |
+
 ### Compression
 
 `st_lonboard(..., compression="auto" | "gzip" | None)` (default `"auto"`)

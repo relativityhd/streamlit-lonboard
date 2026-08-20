@@ -56,6 +56,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when `tooltip` is left at its default `False`. Requires `pickable=True` on
   the layer (lonboard's own default).
 
+### Changed
+
+- Importing `streamlit_lonboard` now stops lonboard's widgets from serializing
+  their state for a Jupyter comm that cannot exist under Streamlit. lonboard
+  layers are ipywidgets `Widget`s, and `Widget.__init__` unconditionally calls
+  `open()`, which Parquet-encodes the whole table plus every accessor column to
+  fill a comm-open message that a kernel-less environment discards. Constructing
+  an `A5Layer` over 200k rows drops from 62ms to 0.6ms; a
+  `ScatterplotLayer.from_geopandas` at the same scale roughly halves (the
+  GeoDataFrame → Arrow conversion is real work that remains). The serialized
+  payload is byte-for-byte identical either way. Layers also stop accumulating
+  in ipywidgets' process-global `_instances` registry, which nothing drains
+  under Streamlit. Set `STREAMLIT_LONBOARD_KEEP_WIDGET_COMM=1` before importing
+  to opt out; the patch version-guards itself and no-ops with a warning if
+  ipywidgets/lonboard internals move. Known consequence: patched widgets have
+  no `comm`/`model_id`, so `Map.to_html()` raises unless you opt out or call
+  `ipywidgets.Widget.open(widget)` first.
+
 ### Fixed
 
 - A rerun that changed only a layer's JSON props (e.g. a slider driving `opacity`

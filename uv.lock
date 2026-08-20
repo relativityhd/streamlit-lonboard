@@ -1875,6 +1875,7 @@ name = "streamlit-lonboard"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "ipywidgets" },
     { name = "lonboard" },
     { name = "pyarrow" },
     { name = "streamlit" },
@@ -1894,6 +1895,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "geopandas", marker = "extra == 'dev'", specifier = ">=1" },
+    { name = "ipywidgets", specifier = ">=8,<9" },
     { name = "lonboard", specifier = ">=0.10" },
     { name = "playwright", marker = "extra == 'bench'" },
     { name = "pyarrow", specifier = ">=14,!=25.0.0" },

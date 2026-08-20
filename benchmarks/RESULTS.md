@@ -342,3 +342,35 @@ something that never renders.
 - **`Map.to_html()` embedded via `components.v1.html`**: doesn't render at
   all, at any scale - a hard architectural gap in the workaround this
   project replaces, not a performance finding.
+
+## Phase 4g: skipping the ipywidgets comm at layer construction
+
+Recorded with `benchmarks/bench_widget_init.py` on an AMD Ryzen AI 9 HX 370
+(24 threads, 78 GB RAM, Fedora 6.17.8, Python 3.14.6, lonboard 0.16.0,
+ipywidgets 8.1.8). No Streamlit and no browser involved — this is pure Python
+layer-construction cost. Best of 5 per cell, single session; the two scenarios
+were measured back-to-back in the same process.
+
+How to reproduce: `uv run python benchmarks/bench_widget_init.py 200000`.
+
+| scenario (200,000 rows) | stock | patched | speedup |
+| --- | --- | --- | --- |
+| `A5Layer` (pre-built Arrow table) | 62.1 ms | 0.6 ms | 98x |
+| `ScatterplotLayer.from_geopandas` | 134.9 ms | 76.8 ms | 2x |
+
+The two rows bracket what to expect. `A5Layer` receives an Arrow table that is
+already built, so essentially *all* of its construction time was the discarded
+comm message — removing it leaves almost nothing. `from_geopandas` additionally
+converts a GeoDataFrame to Arrow and reprojects it, which the patch cannot
+remove; roughly half the time was comm overhead. Real apps land between the two
+depending on how much of the pipeline they do inside lonboard.
+
+The saving scales with table size and accessor count, because the work removed
+is a ZSTD-7 Parquet encode of the table plus every accessor column. On the
+dashboard that prompted this (A5 level 9, 359,600 cells, several accessors) the
+measured construction cost was ~0.76 s per layer, paid on every rerun that did
+not hit `@st.cache_resource`.
+
+Excluded from these numbers: serialization by `st_lonboard()` itself (unchanged
+— the payload is byte-identical with and without the patch, asserted in
+`tests/test_widget_patch.py`), and any browser-side cost.

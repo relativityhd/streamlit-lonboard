@@ -33,6 +33,11 @@ dependencies = [
     # verified against streamlit==1.59.2. Older 1.49-1.58 may work but are untested.
     "streamlit>=1.59",
     "lonboard>=0.10",
+    # Only ever a transitive dependency (lonboard, anywidget), but _widget_patch.py
+    # overrides Widget.open/send_state on lonboard's base classes to skip the unused
+    # Jupyter comm serialization, so we depend on 8.x internals directly. The patch
+    # version-guards itself and no-ops with a warning outside this range.
+    "ipywidgets>=8,<9",
     # !=25.0.0: that release bundles mimalloc 3.3.1, which SIGSEGVs when
     # libarrow is first loaded on a non-main thread that then exits - exactly
     # what Streamlit does (each script run, including the first import of
