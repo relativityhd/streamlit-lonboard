@@ -464,8 +464,9 @@ still 0 ms after this change).
 - `"zstd"` (new): Arrow IPC with the IPC spec's own per-buffer ZSTD
   compression (`IpcWriteOptions(compression="zstd")`). Decompressed
   transparently *inside* the frontend's `tableFromIPC` by a ZSTD codec
-  registered with arrow-js's `compressionRegistry` (`fzstd`, a ~8KB pure-JS
-  decoder). Needed apache-arrow 17 -> 21 in the frontend (the registry API
+  registered with arrow-js's `compressionRegistry` (`zstddec`, a WASM build
+  of the reference decoder; see Phase 4k, which replaced the pure-JS `fzstd`
+  originally used here). Needed apache-arrow 17 -> 21 in the frontend (the registry API
   landed after the arrow-js repo split); `@geoarrow/deck.gl-geoarrow`
   peer-accepts `>=15`, so no other frontend changes.
 - `"parquet"` (new): each layer's table shipped as a complete in-memory
@@ -540,15 +541,15 @@ saved screenshots - the four 1M-point maps are pixel-identical.
 | --------: | ------- | --------: | -------: |
 |    10,000 | none    |       1.2 |      2.3 |
 |    10,000 | gzip    |      11.3 |     14.1 |
-|    10,000 | zstd    |       5.5 |      6.6 |
+|    10,000 | zstd    |       1.5 |      9.5 |
 |    10,000 | parquet |       7.9 |     30.5 |
 |   100,000 | none    |       2.0 |     50.1 |
 |   100,000 | gzip    |      22.6 |     71.2 |
-|   100,000 | zstd    |      28.4 |     75.4 |
+|   100,000 | zstd    |       6.9 |     53.1 |
 |   100,000 | parquet |      18.9 |     79.2 |
 | 1,000,000 | none    |      12.2 |    454.7 |
 | 1,000,000 | gzip    |     200.3 |    700.1 |
-| 1,000,000 | zstd    |     261.4 |    708.4 |
+| 1,000,000 | zstd    |      84.1 |    659.8 |
 | 1,000,000 | parquet |     155.9 |    762.6 |
 
 Reading this table:
@@ -556,34 +557,33 @@ Reading this table:
 - **Uncompressed IPC's near-zero-copy story holds**: 12ms to parse 23MB
   into a usable Arrow table at 1M points. Every compressed mode pays
   10-20x that to decode.
-- **Parquet decodes *fastest* of the three compressed modes at scale**
-  (156ms vs gzip's 200ms vs zstd's 261ms at 1M) - parquet-wasm's Rust ZSTD
-  + BYTE_STREAM_SPLIT reassembly runs at native WASM speed, beating even
-  the browser's native `DecompressionStream("gzip")`.
-- **ZSTD-IPC's decode is the slowest, and it's an implementation artifact,
-  not inherent**: the registered codec is `fzstd`, a pure-JS decoder, plus
-  an alignment copy (see below). Parquet's own WASM ZSTD path proves
-  ~150ms is achievable for the same data; swapping the codec for a WASM
-  ZSTD build (e.g. zstd-codec, at the cost of its download size) would
-  close most of the 100ms gap. At 100k and below the difference is noise.
+- **ZSTD-IPC decodes fastest of the three compressed modes** (84ms vs
+  parquet's 156ms vs gzip's 200ms at 1M), beating even the browser's native
+  `DecompressionStream("gzip")`. These are the Phase 4k numbers: the
+  original pure-JS `fzstd` codec measured 261ms here, *slowest* of the
+  three, and swapping it for WASM reversed the ranking - see Phase 4k.
+- **Parquet still decodes faster than gzip** (156ms vs 200ms): parquet-wasm's
+  Rust ZSTD + BYTE_STREAM_SPLIT reassembly runs at native WASM speed, and
+  it has more to undo, since its payload is the smallest of the three.
 
 ### End-to-end at 1M points: added CPU vs. bytes saved (vs. `None`)
 
 | mode    | added encode+decode | bytes saved | break-even link speed |
 | ------- | ------------------: | ----------: | --------------------: |
 | gzip    |              ~886ms |      2.44MB |              ~22 Mbps |
-| zstd    |              ~275ms |      1.98MB |              ~58 Mbps |
+| zstd    |               ~98ms |      1.98MB |             ~162 Mbps |
 | parquet |              ~260ms |      4.85MB |             ~150 Mbps |
 
 ("Break-even link speed": the bandwidth below which the transfer-time
 saving exceeds the added CPU. Above it, `None` is faster end-to-end.)
 
-**Parquet dominates gzip and zstd at this scale on both axes at once** -
-more bytes saved AND less total CPU - so among the compressed modes the
-choice at 1M is really parquet vs. nothing, with zstd as the
-no-WASM-download middle ground and gzip now strictly dominated (kept for
-compatibility). Remember this is worst-case (uniform-random float64) data:
-on real clustered/quantized data every ratio improves, and parquet's
+**Parquet saves the most bytes; zstd costs the least CPU.** Parquet ships
+2.87MB less than zstd at this scale but spends ~160ms more CPU doing it,
+so which one wins end-to-end depends on the link: below ~162 Mbps both beat
+`None`, and between the two the crossover sits near ~60 Mbps. gzip is
+dominated outright - zstd is smaller *and* ~9x cheaper in total CPU.
+Remember this is worst-case (uniform-random float64) data: on real
+clustered/quantized data every ratio improves, and parquet's
 BYTE_STREAM_SPLIT + dictionary encodings improve fastest.
 
 ### Costs not in the tables
@@ -597,13 +597,15 @@ BYTE_STREAM_SPLIT + dictionary encodings improve fastest.
   NOT base64-inlined into index.js (a vite lib-mode default we had to
   disable twice: once via a non-literal URL in `src/parquet.ts`, once by
   stripping the glue's own `new URL(...)` fallback in `vite.config.ts`).
-- **The arrow-js upgrade + fzstd + parquet-wasm JS glue grew index.js
-  ~2.5MB -> ~3.2MB** (minified; the WASM stays external).
-- **arrow-js's compressed-IPC reader needs an alignment workaround**: codec
-  output is wrapped directly in typed arrays, which require 8-byte
-  alignment, but `fzstd` returns views at arbitrary offsets - the
-  registered codec copies to a fresh buffer when misaligned (see
-  container.ts). Worth rechecking on arrow-js upgrades.
+- **The arrow-js upgrade + zstd codec + parquet-wasm JS glue grew index.js
+  ~2.5MB -> ~3.3MB** (minified, 784KB gzipped; parquet's WASM stays
+  external, zstddec's is inlined in its own JS).
+- **arrow-js's compressed-IPC reader is alignment-sensitive**: codec output
+  is wrapped directly in typed arrays, which require 8-byte alignment. The
+  original `fzstd` returned views at arbitrary offsets and *did* trip this;
+  `zstddec` copies out of the WASM heap so its buffers are always offset 0.
+  The guard in container.ts is retained for the next codec swap. Worth
+  rechecking on arrow-js upgrades.
 - **Multi-map perf-mark hazard fixed in passing**: measures that span an
   `await` (gzip decompress, parquet decode, mount) now use timestamp-based
   `performance.measure` - named marks get wiped by another concurrently
@@ -614,14 +616,13 @@ BYTE_STREAM_SPLIT + dictionary encodings improve fastest.
 
 - **localhost / fast LAN**: `None` (or the `"auto"` default) - decode is
   near-zero-copy and transfer is free; every compressed mode only adds CPU.
-- **remote server (links up to ~150 Mbps), data at 100k+ points**:
+- **remote server, general case**: `"zstd"` - the cheapest compressed mode
+  on both encode and decode, and it adds no network request at all. Its
+  payload is ~20% bigger than parquet's.
+- **remote server, bandwidth-bound (slow link, very large payloads)**:
   `"parquet"` - the best ratio (0.79x on worst-case data, better on real
-  data) *and* the cheapest compressed decode, at the price of a one-time
-  ~1.8MB (gzipped) WASM download on first render.
-- **remote server, want zero extra frontend weight**: `"zstd"` - ~24x
-  cheaper to encode than gzip for nearly the same ratio, no WASM, no
-  bundle-relevant additions (fzstd is ~8KB); its decode-side gap vs.
-  parquet is an artifact of the pure-JS codec and closable later.
+  data), at the price of ~2x zstd's CPU and a one-time ~1.8MB (gzipped)
+  WASM download on first render.
 - **`"gzip"`**: now strictly dominated by both new modes at every scale
   measured (worse CPU than zstd, worse ratio than parquet) - kept as the
   Phase 4d-era option, but there's no configuration where it wins.
@@ -710,82 +711,85 @@ mode) cell verified rendering via screenshot.
 | --------- | ----- | ------- | --------: | -------: |
 | a5-cells  | L07   | none    |       1.5 |      6.1 |
 | a5-cells  | L07   | gzip    |       5.0 |      9.5 |
-| a5-cells  | L07   | zstd    |       8.7 |     12.0 |
+| a5-cells  | L07   | zstd    |       3.2 |      7.8 |
 | a5-cells  | L07   | parquet |       6.7 |      9.9 |
 | a5-cells  | L08   | none    |       6.1 |     17.6 |
 | a5-cells  | L08   | gzip    |      13.8 |     24.4 |
-| a5-cells  | L08   | zstd    |      69.7 |     74.7 |
+| a5-cells  | L08   | zstd    |       6.7 |     17.5 |
 | a5-cells  | L08   | parquet |      18.5 |     22.8 |
 | a5-cells  | L09   | none    |       6.3 |     40.6 |
 | a5-cells  | L09   | gzip    |      47.7 |     81.7 |
-| a5-cells  | L09   | zstd    |     155.1 |    164.4 |
+| a5-cells  | L09   | zstd    |      22.7 |     57.7 |
 | a5-cells  | L09   | parquet |      66.9 |     74.6 |
 | pentagons | L07   | none    |       2.5 |     16.7 |
 | pentagons | L07   | gzip    |      28.2 |     41.0 |
-| pentagons | L07   | zstd    |      70.9 |     78.5 |
+| pentagons | L07   | zstd    |      11.8 |     33.0 |
 | pentagons | L07   | parquet |      32.8 |     39.8 |
 | pentagons | L08   | none    |       6.9 |     49.9 |
 | pentagons | L08   | gzip    |      84.5 |    127.3 |
-| pentagons | L08   | zstd    |     209.9 |    231.3 |
+| pentagons | L08   | zstd    |      43.6 |    562.8 |
 | pentagons | L08   | parquet |     117.4 |    137.4 |
 
-The Phase 4h decode ranking holds on real data at every scale: raw IPC
-near-free, parquet the fastest compressed decode... except gzip, whose
-native `DecompressionStream` pulls ahead of parquet here because real-data
-payloads are so much smaller than synthetic ones that WASM-call overhead
-matters relatively more. zstd's pure-JS `fzstd` decode stays the slowest -
-again an artifact of the codec choice, not the format (see Phase 4h).
+The Phase 4h decode ranking holds on real data at every scale: raw IPC is
+near-free, then zstd, then parquet, then gzip. zstd's margin is *wider*
+here than on synthetic data (3x faster than parquet at a5-cells/L09, 22.7ms
+vs 66.9ms), because these payloads are small enough that parquet's
+per-column reassembly overhead weighs more heavily. The `pentagons/L08`
+mount of 562.8ms is deck.gl tessellating 90k polygons, not decode - compare
+its 43.6ms decode.
 
 ### End-to-end at a5-cells/L09 (358.6k cells): added CPU vs. bytes saved (vs. `None`)
 
 | mode    | added encode+decode | bytes saved | break-even link speed |
 | ------- | ------------------: | ----------: | --------------------: |
-| gzip    |              ~380ms |      9.83MB |             ~210 Mbps |
-| zstd    |              ~160ms |      9.93MB |             ~500 Mbps |
+| gzip    |              ~377ms |      9.83MB |             ~209 Mbps |
+| zstd    |               ~32ms |      9.93MB |            ~2,500 Mbps |
 | parquet |              ~105ms |     10.47MB |             ~800 Mbps |
 
-Compare Phase 4h's synthetic break-evens (22/58/150 Mbps): on real data
-every compressed mode pays for itself on links an order of magnitude
-faster, i.e. **on real data, compression wins on essentially any
-non-localhost connection** - and parquet again dominates on both axes at
-once (most bytes saved, least CPU added).
+Compare Phase 4h's synthetic break-evens: on real data every compressed
+mode pays for itself on links an order of magnitude faster, i.e. **on real
+data, compression wins on essentially any non-localhost connection**. zstd
+is the standout - it removes 79% of the payload for ~32ms of total added
+CPU, which is why it only loses to sending raw bytes above ~2.5 Gbps.
+Parquet still ships 0.54MB less per rerun than zstd, but spends ~73ms more
+CPU to do it; between those two the crossover is ~60 Mbps.
 
 ### Which mode to pick, revised for real data
 
 - The economics tilt much further toward compressing than the synthetic
   numbers implied: on a5-cells@L09, `"zstd"` removes ~9.9MB (79%) of a
-  12.6MB payload for ~15ms of Python and well under 200ms of browser
-  decode - worth it on almost any non-localhost link. The synthetic
-  benchmark's "compression barely pays" framing was an artifact of
-  uniform-random coordinates.
-- `"parquet"` stays the ratio winner (0.17-0.21x on a5-cells) and its
-  decode stays competitive; the choice vs. `"zstd"` remains "best ratio +
-  ~1.8MB one-time WASM" vs. "near-free encode, no extra downloads".
+  12.6MB payload for ~15ms of Python and ~23ms of browser decode - worth it
+  on almost any non-localhost link. The synthetic benchmark's "compression
+  barely pays" framing was an artifact of uniform-random coordinates.
+- `"parquet"` stays the ratio winner (0.17-0.21x on a5-cells) but is no
+  longer the cheap option on either side of the wire: vs. `"zstd"` it costs
+  ~3x the encode, ~3x the decode, and a one-time ~1.8MB WASM download, to
+  save ~20% more bytes. That trade only pays on genuinely bandwidth-bound
+  deployments, which is why `"auto"` reserves it for the largest payloads
+  (see Phase 4k).
 - DGGS-style payloads (`a5-cells`) are the best case for *every* mode:
   if you can ship cell ids instead of boundary polygons, the payload is
   already 4-5x smaller before compression enters the picture (797KB vs.
   4.4MB at L07), and compresses harder on top.
 
-## Phase 4j: Parquet becomes the default (`compression="auto"`)
+## Phase 4j: `compression="auto"` starts compressing by default
 
 Given Phase 4h/4i, `"auto"` - the default - no longer means "plain IPC, gzip
-the whole body above 1MB". It now resolves **per layer**:
+the whole body above 1MB". It now resolves **per layer**, in three tiers
+(final shape; the two-tier version this section originally described was
+revised in Phase 4k, once a WASM zstd codec changed the decode ranking):
 
 | layer's `table.nbytes` | encoding shipped |
 | ---------------------- | ---------------- |
 | < `AUTO_COMPRESSION_THRESHOLD` (1MB) | `ipc` (unchanged, plain Arrow IPC) |
-| >= threshold | `parquet` (ZSTD + BYTE_STREAM_SPLIT policy) |
+| 1MB - `AUTO_PARQUET_THRESHOLD` (20MB) | `ipc-zstd` |
+| >= 20MB | `parquet` (ZSTD + BYTE_STREAM_SPLIT policy) |
 
-Why parquet rather than zstd for the default, given zstd needs no WASM: on
-every scale measured, parquet is both smaller *and* cheaper to decode than
-zstd, so the only thing weighing against it is the one-time WASM download.
-That turned out to be much smaller than assumed - **1.8MB, not 6.5MB**:
-Streamlit's gzip middleware bypasses only `/static/`, and component assets
-are served from `_stcore/bidi-components/`, so the binary ships compressed
-(measured `encodedBodySize` 1,908,319 in a live browser) and is then
-browser-cached. Against a5-cells@L09's 10.47MB saved per rerun that
-amortizes on the *first* payload; even against zstd (the next best mode) it
-breaks even after ~3 reruns.
+The parquet-wasm download that gates the top tier is much smaller than
+first assumed - **1.8MB, not the 6.5MB on disk**: Streamlit's gzip
+middleware bypasses only `/static/`, and component assets are served from
+`_stcore/bidi-components/`, so the binary ships compressed (measured
+`encodedBodySize` 1,908,319 in a live browser) and is then browser-cached.
 
 Design notes:
 
@@ -801,8 +805,8 @@ Design notes:
   matches its own `compression=` - catching stale-cache/mismatch bugs
   loudly instead of shipping mis-decodable bytes.
 - **Sub-threshold payloads are byte-identical to before** (no
-  `bodyEncoding` key at all), so small apps see no wire change and, more
-  importantly, never trigger the parquet-wasm fetch.
+  `bodyEncoding` key at all), so small apps see no wire change. Only the
+  top tier triggers the parquet-wasm fetch, so most apps never pay it.
 - **Localhost caveat unchanged**: `"auto"` cannot know the link speed, so a
   large payload served over localhost now pays parquet encode/decode for
   transfer that was free. That is still strictly better than the gzip
@@ -812,3 +816,48 @@ Design notes:
 Verified end-to-end in a real browser (`benchmarks/wire_verify_app.py`, now
 including an `"auto"` map at 100k points): all five modes render
 identically, the WASM is fetched exactly once, and the console stays clean.
+
+## Phase 4k: swapping the ZSTD codec for WASM, and what it changed
+
+Phase 4h flagged zstd's slow decode as "an implementation artifact, not
+inherent" - the registered codec was `fzstd`, a ~8KB pure-JS decoder.
+Replacing it with `zstddec` (a WASM build of the reference decoder)
+confirmed that and reversed the decode ranking.
+
+| case | fzstd (pure JS) | zstddec (WASM) | speedup | parquet, for reference |
+| --- | ---: | ---: | ---: | ---: |
+| synthetic 10k | 5.5 ms | 1.5 ms | 3.7x | 7.9 ms |
+| synthetic 100k | 28.4 ms | 6.9 ms | 4.1x | 18.9 ms |
+| synthetic 1M | 261.4 ms | 84.1 ms | 3.1x | 155.9 ms |
+| a5-cells L08 | 69.7 ms | 6.7 ms | 10.4x | 18.5 ms |
+| a5-cells L09 | 155.1 ms | 22.7 ms | 6.8x | 66.9 ms |
+| pentagons L08 | 209.9 ms | 43.6 ms | 4.8x | 117.4 ms |
+
+**zstd went from the slowest compressed decode to the fastest**, roughly 3x
+quicker than parquet on real data. Correctness was checked before speed:
+both codecs were run over the same 358k-row payload and compared buffer by
+buffer - 12,550,965 decoded bytes, zero differences.
+
+Why `zstddec` over the alternatives:
+
+- Its WASM is **base64-inlined into its own JS**, so unlike parquet-wasm it
+  needs no separate asset, no copy step, and no extra network request - it
+  just costs ~24KB gzipped in the bundle (30.5KB vs fzstd's 6.9KB).
+  `@bokuweb/zstd-wasm` is a smaller binary (80KB gzipped) but would have
+  needed the same separate-asset plumbing parquet required.
+- It sizes the frame itself when passed `0` as the uncompressed length,
+  which matters because arrow-js consumes the 8-byte length prefix before
+  handing the codec its bytes.
+- It copies out of the WASM heap (`heap.slice(...)`), so sequential decodes
+  can't clobber each other's output - important since arrow-js decodes
+  every buffer in a batch before assembling the table.
+
+The one cost: the codec interface is **synchronous**, so the WASM module
+must be instantiated *before* `tableFromIPC` runs. `parseContainer` now
+awaits a one-time `ensureZstdReady()` before parsing a zstd layer.
+
+**This changed the default.** Phase 4j had reached for parquet above 1MB
+partly because it was then both smaller *and* faster to decode than zstd.
+With that no longer true, `"auto"` now ships zstd in the middle tier and
+reserves parquet for payloads large enough that bytes clearly dominate
+(`AUTO_PARQUET_THRESHOLD`, 20MB) - see the tier table above.

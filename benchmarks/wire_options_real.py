@@ -45,6 +45,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--cases", default=",".join(f"{s}:{lv}" for s, lv in DEFAULT_CASES))
+    parser.add_argument(
+        "--modes",
+        default=",".join(name for name, _ in MODES),
+        help="comma-separated subset of none,gzip,zstd,parquet (see wire_options.py).",
+    )
     parser.add_argument("--skip-browser", action="store_true")
     parser.add_argument("--out", default=None)
     parser.add_argument("--screenshot-dir", default=None)
@@ -53,6 +58,7 @@ def main() -> None:
     if args.data_root:
         os.environ["A5_DATA_ROOT"] = args.data_root
     cases = [tuple(c.split(":")) for c in args.cases.split(",")]
+    selected = [m for m in MODES if m[0] in set(args.modes.split(","))]
     screenshot_dir = Path(args.screenshot_dir) if args.screenshot_dir else None
 
     results: dict = {"python": [], "browser": []}
@@ -61,13 +67,15 @@ def main() -> None:
         layer, tooltip, _colors = build_scenario(scenario, level)
         n = layer.table.num_rows
         results["python"].extend(
-            measure_python_layer(layer, n=n, tooltip=tooltip, extra={"scenario": scenario, "level": level})
+            measure_python_layer(
+                layer, n=n, tooltip=tooltip, extra={"scenario": scenario, "level": level}, modes=selected
+            )
         )
         del layer
 
     if not args.skip_browser:
         for scenario, level in cases:
-            for mode_name, _ in MODES:
+            for mode_name, _ in selected:
                 print(f"--- Part 2 (browser decode) {scenario} @ {level} {mode_name} ---", file=sys.stderr)
                 try:
                     row = measure_browser(

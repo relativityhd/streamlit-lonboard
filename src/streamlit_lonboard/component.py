@@ -90,22 +90,22 @@ def st_lonboard(
     shown.
 
     `compression` controls how the Arrow payload is encoded on the wire (see
-    benchmarks/RESULTS.md Phase 4h/4i for the measurements behind these):
-    - `"auto"` (default): decided per layer against its table size. Layers
-      under `serialize.AUTO_COMPRESSION_THRESHOLD` (1MB) ship as plain,
-      near-zero-copy Arrow IPC; larger ones ship as Parquet. Below the
-      threshold the CPU isn't worth it (on localhost, transfer is free), and
-      an app whose layers all stay under it never downloads parquet-wasm.
+    benchmarks/RESULTS.md Phases 4h-4k for the measurements behind these):
+    - `"auto"` (default): decided per layer against its table size, in three
+      tiers. Under `serialize.AUTO_COMPRESSION_THRESHOLD` (1MB): plain,
+      near-zero-copy Arrow IPC, because the CPU isn't worth it (on
+      localhost, transfer is free). Up to `serialize.AUTO_PARQUET_THRESHOLD`
+      (20MB): ZSTD-compressed Arrow IPC. Above that: Parquet.
+    - `"zstd"`: Arrow IPC with ZSTD-compressed record-batch buffers (the IPC
+      spec's own per-buffer compression). Fastest decode of any compressed
+      mode measured and near-free to encode, with no extra download - its
+      decoder is bundled.
     - `"parquet"`: always Parquet (ZSTD + BYTE_STREAM_SPLIT), decoded back to
       Arrow in the browser by parquet-wasm - a one-time ~1.8MB (gzipped)
-      WASM download, then browser-cached. Best measured compression ratio
-      *and* fastest compressed-mode decode.
-    - `"zstd"`: Arrow IPC with ZSTD-compressed record-batch buffers (the IPC
-      spec's own per-buffer compression). Slightly worse ratio and slower
-      decode than Parquet, but needs no WASM download at all - the better
-      pick for one-shot/public apps whose visitors never return.
+      WASM download, then browser-cached. ~20% smaller on the wire than
+      `"zstd"`, at roughly 3x its encode and decode cost.
     - `"gzip"`: plain Arrow IPC, whole-body gzip. Kept for compatibility;
-      superseded by the two above on every axis except decode speed.
+      `"zstd"` beats it on size, encode *and* decode.
     - `None`: plain Arrow IPC, never compressed. Best on localhost.
 
     `picking_radius`, `parameters`, `use_device_pixels`, and `custom_attribution`

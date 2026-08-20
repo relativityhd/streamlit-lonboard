@@ -234,20 +234,62 @@ def test_pack_payload_compression_auto_ships_small_layers_as_plain_ipc(points_gd
     assert body == serialized.body_bytes
 
 
-def test_pack_payload_compression_auto_ships_large_layers_as_parquet():
+def test_pack_payload_compression_auto_ships_midsize_layers_as_zstd():
+    """Middle tier: past AUTO_COMPRESSION_THRESHOLD but under
+    AUTO_PARQUET_THRESHOLD, so it compresses without pulling parquet-wasm."""
     layer = ScatterplotLayer.from_geopandas(_large_points_gdf(), get_fill_color=[255, 0, 0])
     serialized = serialize.serialize_layer(layer, "layer-0", encoding="auto")
-    assert serialized.table.nbytes >= serialize.AUTO_COMPRESSION_THRESHOLD
-    assert serialized.encoding == "parquet"
+    assert serialize.AUTO_COMPRESSION_THRESHOLD <= serialized.table.nbytes < serialize.AUTO_PARQUET_THRESHOLD
+    assert serialized.encoding == "ipc-zstd"
 
     blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="auto")
 
     header, body = _unpack(blob)
-    # Compression happens inside the Parquet file, not as a whole-body pass.
+    # Compression happens inside the IPC buffers, not as a whole-body pass.
     assert header["compression"] is None
-    assert header["layers"][0]["bodyEncoding"] == "parquet"
+    assert header["layers"][0]["bodyEncoding"] == "ipc-zstd"
     assert body == serialized.body_bytes
     assert len(body) < serialized.table.nbytes
+
+
+def test_pack_payload_compression_auto_ships_huge_layers_as_parquet(monkeypatch):
+    """Top tier. The threshold is lowered rather than building a genuinely
+    20MB+ table, which would dominate the suite's runtime for no extra
+    coverage - the branch under test is the size comparison itself."""
+    layer = ScatterplotLayer.from_geopandas(_large_points_gdf(), get_fill_color=[255, 0, 0])
+    monkeypatch.setattr(serialize, "AUTO_PARQUET_THRESHOLD", 1_000_000)
+    serialized = serialize.serialize_layer(layer, "layer-0", encoding="auto")
+    assert serialized.table.nbytes >= serialize.AUTO_PARQUET_THRESHOLD
+    assert serialized.encoding == "parquet"
+
+    blob = serialize.pack_payload([serialized], view_state=None, map_options={}, compression="auto")
+
+    header, _ = _unpack(blob)
+    assert header["compression"] is None
+    assert header["layers"][0]["bodyEncoding"] == "parquet"
+
+
+def test_resolve_body_encoding_tier_boundaries(points_gdf):
+    """The tier edges are inclusive-at-the-bottom, and a non-"auto" request is
+    passed through untouched regardless of size."""
+    table = serialize.serialize_layer(
+        ScatterplotLayer.from_geopandas(points_gdf, get_fill_color=[255, 0, 0]), "layer-0", encoding="ipc"
+    ).table
+
+    class _SizedTable:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+    below = _SizedTable(serialize.AUTO_COMPRESSION_THRESHOLD - 1)
+    at_zstd = _SizedTable(serialize.AUTO_COMPRESSION_THRESHOLD)
+    at_parquet = _SizedTable(serialize.AUTO_PARQUET_THRESHOLD)
+
+    assert serialize.resolve_body_encoding("auto", below) == "ipc"
+    assert serialize.resolve_body_encoding("auto", at_zstd) == "ipc-zstd"
+    assert serialize.resolve_body_encoding("auto", at_parquet) == "parquet"
+    # Explicit requests ignore size entirely.
+    assert serialize.resolve_body_encoding("ipc", at_parquet) == "ipc"
+    assert serialize.resolve_body_encoding("parquet", table) == "parquet"
 
 
 def test_pack_payload_compression_auto_mixes_encodings_across_layers(points_gdf):
@@ -264,7 +306,7 @@ def test_pack_payload_compression_auto_mixes_encodings_across_layers(points_gdf)
 
     header, _ = _unpack(blob)
     assert "bodyEncoding" not in header["layers"][0]
-    assert header["layers"][1]["bodyEncoding"] == "parquet"
+    assert header["layers"][1]["bodyEncoding"] == "ipc-zstd"
 
 
 def test_pack_payload_compression_rejects_unknown_value(points_gdf):

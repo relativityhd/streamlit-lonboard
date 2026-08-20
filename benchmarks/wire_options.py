@@ -70,17 +70,17 @@ def _build_layer(n: int) -> ScatterplotLayer:
     )
 
 
-def measure_python(n: int) -> list[dict]:
-    return measure_python_layer(_build_layer(n), n=n)
+def measure_python(n: int, *, modes=None) -> list[dict]:
+    return measure_python_layer(_build_layer(n), n=n, modes=modes)
 
 
-def measure_python_layer(layer, *, n: int, tooltip=False, extra: dict | None = None) -> list[dict]:
+def measure_python_layer(layer, *, n: int, tooltip=False, extra: dict | None = None, modes=None) -> list[dict]:
     """Part-1 measurement for an arbitrary prebuilt lonboard layer.
 
     `extra` is merged into every result row (e.g. a scenario label for the
     real-data benchmark, see wire_options_real.py)."""
     rows = []
-    for mode_name, compression in MODES:
+    for mode_name, compression in modes or MODES:
         encoding = serialize.body_encoding_for(compression)
         serialized = serialize.serialize_layer(layer, "layer-0", tooltip=tooltip, encoding=encoding)
 
@@ -278,21 +278,28 @@ def measure_browser(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scales", default=",".join(str(s) for s in DEFAULT_SCALES))
+    parser.add_argument(
+        "--modes",
+        default=",".join(name for name, _ in MODES),
+        help="comma-separated subset of none,gzip,zstd,parquet - useful when only one "
+        "mode's implementation changed and the others' numbers still stand.",
+    )
     parser.add_argument("--skip-browser", action="store_true")
     parser.add_argument("--out", default=None)
     parser.add_argument("--screenshot-dir", default=None)
     args = parser.parse_args()
     scales = [int(s) for s in args.scales.split(",")]
+    selected = [m for m in MODES if m[0] in set(args.modes.split(","))]
     screenshot_dir = Path(args.screenshot_dir) if args.screenshot_dir else None
 
     results: dict = {"python": [], "browser": []}
     for n in scales:
         print(f"--- Part 1 (encode/size) @ {n:,} ---", file=sys.stderr)
-        results["python"].extend(measure_python(n))
+        results["python"].extend(measure_python(n, modes=selected))
 
     if not args.skip_browser:
         for n in scales:
-            for mode_name, _ in MODES:
+            for mode_name, _ in selected:
                 print(f"--- Part 2 (browser decode) {mode_name} @ {n:,} ---", file=sys.stderr)
                 try:
                     row = measure_browser(n, mode_name, screenshot_dir)

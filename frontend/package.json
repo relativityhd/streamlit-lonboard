@@ -18,9 +18,9 @@
     "@geoarrow/deck.gl-geoarrow": "^0.4.1",
     "@math.gl/polygon": "^4.1.0",
     "apache-arrow": "^21.2.0",
-    "fzstd": "^0.1.1",
     "maplibre-gl": "^4.7.1",
-    "parquet-wasm": "^0.7.2"
+    "parquet-wasm": "^0.7.2",
+    "zstddec": "^0.2.0"
   },
   "devDependencies": {
     "rollup-plugin-license": "^3.7.1",

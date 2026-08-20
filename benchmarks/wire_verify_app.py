@@ -5,8 +5,9 @@ Usage: uv run streamlit run benchmarks/wire_verify_app.py
 Renders the same scatterplot once per `compression=` mode ("auto", None,
 "gzip", "zstd", "parquet"). Every map must look identical and the browser
 console must stay error-free. N is chosen above
-`serialize.AUTO_COMPRESSION_THRESHOLD` so the "auto" map resolves to Parquet
-- i.e. this page covers the default path, not just the explicit ones.
+`serialize.AUTO_COMPRESSION_THRESHOLD` (but below `AUTO_PARQUET_THRESHOLD`),
+so the "auto" map exercises the middle ZSTD tier of the default - i.e. this
+page covers the default path, not just the explicitly-named ones.
 """
 
 import os
@@ -22,8 +23,9 @@ from shapely.geometry import Point
 
 from streamlit_lonboard import st_lonboard
 
-# Above AUTO_COMPRESSION_THRESHOLD (~2.3MB of table at this N), so the
-# "auto" map below actually exercises the Parquet branch of the default.
+# Above AUTO_COMPRESSION_THRESHOLD but below AUTO_PARQUET_THRESHOLD (~2.3MB
+# of table at this N), so the "auto" map below exercises the middle
+# (ZSTD) tier of the default; the explicit "parquet" map covers the top tier.
 N = 100_000
 MODES = ["auto", None, "gzip", "zstd", "parquet"]
 

@@ -7,7 +7,7 @@
  */
 
 import { compressionRegistry, CompressionType, tableFromIPC, type Table } from "apache-arrow";
-import { decompress as zstdDecompress } from "fzstd";
+import { ZSTDDecoder } from "zstddec";
 import type { ExtensionHeader } from "./extensions";
 import { fnv1a, fnv1aString } from "./fingerprint";
 import { parquetToIPC } from "./parquet";
@@ -19,15 +19,36 @@ const SUPPORTED_PAYLOAD_FORMAT_VERSION = 1;
 // buffers produced by `st_lonboard(compression="zstd")` (the IPC spec's
 // per-buffer body compression - arrow-js strips each buffer's 8-byte
 // uncompressed-length prefix itself and hands the codec raw ZSTD frames).
-// Registered unconditionally at module load: fzstd is a ~8KB pure-JS
-// decoder, and an uncompressed stream never consults the registry.
+//
+// zstddec is a WASM build of the reference decoder, ~3.7x faster than the
+// pure-JS alternative on a real 358k-row payload (26ms vs 95ms). Its WASM is
+// base64-inlined into its own JS, so unlike parquet-wasm it needs no separate
+// asset and no extra network request - it just costs ~24KB gzipped in the
+// bundle, paid by every user whether or not they ship zstd payloads.
+const zstdDecoder = new ZSTDDecoder();
+let zstdReady: Promise<void> | null = null;
+
+/**
+ * Instantiates the ZSTD WASM module (idempotent). Must be awaited before any
+ * `tableFromIPC` call on a zstd-compressed stream: arrow-js's codec interface
+ * is synchronous, so the decoder has to be live before parsing starts.
+ */
+function ensureZstdReady(): Promise<void> {
+  zstdReady ??= zstdDecoder.init();
+  return zstdReady;
+}
+
 compressionRegistry.set(CompressionType.ZSTD, {
   decode(data: Uint8Array): Uint8Array {
-    const out = zstdDecompress(data);
-    // fzstd returns views into an internal buffer at arbitrary byteOffset;
-    // arrow-js wraps the returned chunk in typed arrays directly
-    // (Float64Array etc.), which require 8-byte alignment - slice() copies
-    // to a fresh, offset-0 buffer when needed.
+    // Second arg is the uncompressed size, which we do not have - arrow-js
+    // consumes the 8-byte length prefix before calling us. 0 makes zstddec
+    // read the size from the frame header instead.
+    const out = zstdDecoder.decode(data, 0);
+    // zstddec copies out of the WASM heap (`heap.slice(...)`), so each call
+    // returns an independent, offset-0 buffer that a later decode cannot
+    // clobber. The guard is therefore a no-op today, kept because arrow-js
+    // wraps this chunk in typed arrays directly (Float64Array etc.) and a
+    // future codec returning a heap *view* would break on alignment.
     return out.byteOffset % 8 === 0 ? out : out.slice();
   },
 });
@@ -221,6 +242,16 @@ export async function parseContainer(
     }
 
     let ipcBytes = bodyBytes;
+    if (bodyEncoding === "ipc-zstd") {
+      // The codec is synchronous, so the WASM module must be live *before*
+      // tableFromIPC starts. One-time; subsequent layers resolve instantly.
+      const start = performance.now();
+      await ensureZstdReady();
+      performance.measure(`st-lonboard:zstdInit[${layerHeader.id}]`, {
+        start,
+        end: performance.now(),
+      });
+    }
     if (bodyEncoding === "parquet") {
       // Timestamp-based for the same reason as the decompress measure above
       // (the WASM init this may await is exactly when other instances run).
@@ -234,14 +265,12 @@ export async function parseContainer(
 
     // For "ipc-zstd", per-buffer ZSTD decompression happens inside this call
     // (via the codec registered above) - its cost shows up in this measure.
-    performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:start`);
+    const parseStartedAt = performance.now();
     const table = tableFromIPC(ipcBytes);
-    performance.mark(`st-lonboard:tableFromIPC[${layerHeader.id}]:end`);
-    performance.measure(
-      `st-lonboard:tableFromIPC[${layerHeader.id}]`,
-      `st-lonboard:tableFromIPC[${layerHeader.id}]:start`,
-      `st-lonboard:tableFromIPC[${layerHeader.id}]:end`,
-    );
+    performance.measure(`st-lonboard:tableFromIPC[${layerHeader.id}]`, {
+      start: parseStartedAt,
+      end: performance.now(),
+    });
     layers.push({ header: layerHeader, bytesFingerprint, headerFingerprint, table });
   }
 

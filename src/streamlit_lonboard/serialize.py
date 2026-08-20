@@ -55,8 +55,8 @@ Compression = Literal["auto", "gzip", "zstd", "parquet"] | None
 BodyEncoding = Literal["ipc", "ipc-zstd", "parquet"]
 
 # What `compression=` asks for, before per-layer resolution. "auto" is not a
-# wire encoding: it picks between "ipc" and "parquet" per layer, once that
-# layer's table size is known (see `resolve_body_encoding`).
+# wire encoding: it picks one of the three above per layer, once that layer's
+# table size is known (see `resolve_body_encoding`).
 RequestedBodyEncoding = Literal["ipc", "ipc-zstd", "parquet", "auto"]
 
 
@@ -78,14 +78,27 @@ def body_encoding_for(compression: Compression) -> RequestedBodyEncoding:
 def resolve_body_encoding(requested: RequestedBodyEncoding, table: pa.Table) -> BodyEncoding:
     """Resolve a requested encoding against one layer's finished table.
 
-    Only "auto" depends on the table: it ships Parquet once the layer is big
-    enough for the compression to pay for itself, and plain IPC below that.
+    Only "auto" depends on the table; it has three tiers, keyed on
     `table.nbytes` (the in-memory footprint, a close proxy for the IPC stream
-    size) is used rather than encoding twice to measure.
+    size, so nothing has to be encoded twice just to measure it):
+
+    - below `AUTO_COMPRESSION_THRESHOLD`: plain "ipc". Compression can't pay
+      for itself, and this tier never pulls parquet-wasm.
+    - up to `AUTO_PARQUET_THRESHOLD`: "ipc-zstd" - the fastest decode of any
+      compressed mode measured, near-free to encode, and it adds no network
+      request at all (its decoder is bundled).
+    - at or above `AUTO_PARQUET_THRESHOLD`: "parquet", whose ~20% better
+      ratio starts to outweigh both its slower encode/decode and its
+      one-time WASM download.
     """
     if requested != "auto":
         return requested
-    return "parquet" if table.nbytes >= AUTO_COMPRESSION_THRESHOLD else "ipc"
+    nbytes = table.nbytes
+    if nbytes >= AUTO_PARQUET_THRESHOLD:
+        return "parquet"
+    if nbytes >= AUTO_COMPRESSION_THRESHOLD:
+        return "ipc-zstd"
+    return "ipc"
 
 
 # `st_lonboard(tooltip=...)`: `True` ships every available non-geometry,
@@ -95,16 +108,25 @@ def resolve_body_encoding(requested: RequestedBodyEncoding, table: pa.Table) -> 
 # different layers commonly have different schemas); `False` ships none.
 TooltipSpec = bool | tuple[str, ...]
 
-# Per layer, "auto" ships Parquet only once that layer's in-memory table
-# reaches this many bytes; below it the layer goes out as plain, near-zero-
-# copy Arrow IPC. Two costs justify a floor rather than always compressing:
-# the encode/decode CPU (pure overhead on localhost, where transfer is
-# free - see IMPLEMENTATION_PLAN.md §2 and Phase 4d), and parquet-wasm's
-# one-time ~1.8MB (gzipped) WASM download, which an app whose layers all
-# stay under this threshold never pays at all. Chosen so the 10k-point
-# baseline (~233KB, see benchmarks/RESULTS.md) stays uncompressed by default
-# while 100k+ (~2.3MB+) does not.
+# Per layer, "auto" leaves the table uncompressed below this many in-memory
+# bytes: the encode/decode CPU is pure overhead on localhost, where transfer
+# is free (see IMPLEMENTATION_PLAN.md §2 and Phase 4d). Chosen so the
+# 10k-point baseline (~233KB, see benchmarks/RESULTS.md) stays uncompressed
+# by default while 100k+ (~2.3MB+) does not.
 AUTO_COMPRESSION_THRESHOLD = 1_000_000
+
+# ...and only reaches for Parquet at this size. Between the two thresholds
+# "auto" ships ZSTD-compressed Arrow IPC instead, which decodes ~3x faster
+# than Parquet and needs no extra download, at ~20% more bytes on the wire
+# (measured in benchmarks/RESULTS.md Phase 4k).
+#
+# This is a deliberately conservative "bandwidth clearly dominates" line, not
+# a measured crossover: the two modes' CPU and size costs both scale with the
+# payload, so their true break-even sits near a *link speed* (~50-60 Mbps on
+# the real-data scenarios) rather than a byte count. What a byte count does
+# capture is that the fixed ~1.8MB (gzipped) parquet-wasm download amortizes
+# in ~2 reruns at this size, versus ~3-4 at the lower threshold.
+AUTO_PARQUET_THRESHOLD = 20_000_000
 
 # lonboard `_layer_type` -> frontend GeoArrow*Layer tag (see frontend/src/layers.ts)
 SUPPORTED_LAYER_TYPES = {
