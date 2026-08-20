@@ -49,6 +49,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no `comm`/`model_id`, so `Map.to_html()` raises unless you opt out or call
   `ipywidgets.Widget.open(widget)` first.
 
+### Fixed
+
+- `streamlit_lonboard.__version__` no longer reports a stale hardcoded version.
+  It is now read from the installed distribution metadata, so `pyproject.toml`
+  stays the single source of truth; the literal it replaced was synced by
+  nothing and still read `0.1.0.dev0` after `0.2.0` shipped.
+
 ## [0.2.0] - 2026-08-20
 
 ### Added

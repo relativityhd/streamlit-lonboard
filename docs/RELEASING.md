@@ -17,6 +17,12 @@ behalf, and what to do when it goes sideways.
 ## Bump levels
 
 The version lives in `pyproject.toml` and is bumped by `uv version --bump`.
+That is the single source of truth: `scripts/sync_version.py` mirrors it into
+`frontend/package.json`, `uv version` re-locks `uv.lock`, and
+`streamlit_lonboard.__version__` reads it back out of the installed distribution
+metadata at import time. Do not hardcode the version anywhere else - an
+unsynced copy silently goes stale (`__version__` used to be one, and still read
+`0.1.0.dev0` after `0.2.0` shipped).
 
 | Input    | `0.1.0.dev0` becomes | Use when                                        |
 | -------- | -------------------- | ----------------------------------------------- |
