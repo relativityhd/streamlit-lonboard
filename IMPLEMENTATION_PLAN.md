@@ -221,16 +221,20 @@ else changing) is already free. What's left for 4b is the case where
 `mount()` *does* fire because *something* changed — e.g. one of several
 layers — and rebuilds every layer instead of just the changed one.
 
-- [x] Per-layer granularity: `container.ts`'s `parseContainer` now takes a
-  `previousFingerprints` map and computes an FNV-1a fingerprint per layer's
-  raw byte slice *before* parsing, returning `{status: "unchanged"}` (no
-  `tableFromIPC` call at all) for a match instead of just skipping layer
-  construction — `tableFromIPC` is the dominant frontend cost at scale (4.0
-  baseline), so skipping the parse matters more than skipping layer
-  construction alone. `index.ts`'s `mount()` keeps a
-  `layerCache: Map<layerId, {fingerprint, deckLayers, subLayerEntries}>` on
-  the mount state and reuses the prior deck.gl `Layer` instances verbatim
-  (same object references, not just same id) for unchanged layers.
+- [x] Per-layer granularity: `container.ts`'s `parseContainer` takes a
+  `previousBytesFingerprints` map and computes an FNV-1a fingerprint per
+  layer's raw byte slice *before* parsing, omitting the parsed `table` from
+  its result (no `tableFromIPC` call at all) for a match instead of just
+  skipping layer construction — `tableFromIPC` is the dominant frontend cost
+  at scale (4.0 baseline), so skipping the parse matters more than skipping
+  layer construction alone. `index.ts`'s `mount()` keeps a
+  `layerCache: Map<layerId, {bytesFingerprint, headerFingerprint, table,
+  deckLayers, subLayerEntries}>` on the mount state and reuses the prior
+  deck.gl `Layer` instances verbatim (same object references, not just same
+  id) when both fingerprints match. A second fingerprint over `{props,
+  extensions}` was added later (see the `### Fixed` entry in `CHANGELOG.md`)
+  so that a prop-only change still rebuilds the deck.gl layers while reusing
+  the already-parsed Arrow table.
 - [x] `subLayerLookup` stays consistent: cached `subLayerEntries` are
   re-inserted for reused layers on every `mount()` call, so picking/hover
   resolve correctly for layers served entirely from cache.
@@ -397,6 +401,114 @@ layers — and rebuilds every layer instead of just the changed one.
   when the same layer object is reused across multiple `st_lonboard()` calls.
 - Exit criteria: every failure mode above produces a message that names the
   offending layer and says what to do about it; none of them crash the app.
+
+#### 4f — Accessor-only updates without re-tessellation
+
+Found by profiling a real dashboard: changing *only* the colormap on a 158,927-cell
+A5 choropleth cost ~8.9s of browser main-thread time, scaling linearly with cell
+count (~56us/cell). The payload itself was never the problem — 1.91 MB, parsed in
+33ms.
+
+- [x] Root cause: Streamlit re-sends the whole component payload on any change, so
+  new colours arrive as a new Arrow table. `buildDeckLayers` then passed a new
+  `RecordBatch` as `data`, and deck.gl's default data check is reference equality —
+  so it reported "a new data container was supplied" and invalidated everything,
+  re-deriving every cell boundary (`cellToBoundary`) and re-running earcut.
+- [x] Prototyped the mechanism *before* committing to an architecture, since
+  everything else depended on whether the leaf layers could be convinced to keep
+  their tessellation. Measured in a real browser at 160k A5 cells: recolour dropped
+  from 480,000 `cellToBoundary` calls + 1 tessellation to **0 and 0**, with the
+  canvas hash proving colours still changed and picking still resolving to the
+  right row. Only then was the real implementation written.
+- [x] Rejected the wire-format split (one IPC stream per column group, bumping
+  `PAYLOAD_FORMAT_VERSION`): it forces the Python package and its `frontend_dist`
+  to be upgraded in lockstep, reworks `pack_payload`/`_unpack`/the determinism
+  tests, and breaks picking — tooltips read their columns off the picked row of the
+  *data* batch, so splitting tooltip columns into a second table breaks that path.
+  Its only extra win over the frontend-only approach is skipping a ~30ms geometry
+  re-parse.
+- [x] `frontend/src/columnFingerprint.ts` fingerprints every column's Arrow buffers
+  after parsing (recursing into children for nested geometry types) and tags each
+  `RecordBatch` with the combined fingerprint of its geometry-bearing columns —
+  GeoArrow-encoded columns, plus the accessor columns that carry geometry for
+  DGGS/arc layers (mirrors `_REQUIRED_ACCESSORS` in `serialize.py`; the two must
+  stay in lockstep). Hashing is 64-bit-wide: unlike the payload-level fingerprints,
+  a collision here would leave *stale geometry on screen* rather than just cost a
+  redundant rebuild.
+- [x] `layers.ts` passes a module-level `dataComparator` that treats equal tags as
+  unchanged, plus per-accessor `updateTriggers` keyed on each column's fingerprint.
+  `CompositeLayer.getSubLayerProps` copies only an allowlist (which excludes
+  `dataComparator`), so the comparator is re-injected through `_subLayerProps` at
+  each composite boundary that needs it — `cell`/`fill`/`stroke` for the
+  GeoCellLayer families, `hexagon-cell-hifi`/`hexagon-cell` for H3, `fill`/`stroke`
+  for polygon. Everything else reaches its leaf through the GeoArrow layers'
+  `...otherProps` spread.
+- [x] Fails safe: if a future deck.gl/geoarrow release renames those sublayer ids,
+  the comparator stops matching and rendering falls back to a full rebuild — slower,
+  never wrong. Re-run the recolour benchmark on any deck.gl/geoarrow bump.
+- [x] No wire-format change; `PAYLOAD_FORMAT_VERSION` stays 1, Python is untouched,
+  and both existing fast paths still hold (byte-identical reruns still skip
+  `mount()` entirely, and the whole-layer cache still reuses `Layer` instances).
+  The props-only path improves too: cached tables keep their tags, so a
+  slider-driven prop change no longer re-tessellates either.
+- [x] Benchmarked with `benchmarks/bench_recolor_app.py` +
+  `playwright_driver.py --recolor`; numbers in `benchmarks/RESULTS.md`. Note the
+  benchmark sets `high_precision=True` on H3: deck.gl's `highPrecision: "auto"`
+  default instances a single hexagon through `ColumnLayer`, which is cheap enough
+  (0.6s at 160k) that it never exhibited the problem. A5/S2/geohash have no such
+  fast path, which is why they were the families that hurt. A5 itself has no
+  published Python bindings, so its numbers were measured directly in the browser.
+- Exit criteria met: colour-only rerun at 160k cells produces no multi-second
+  main-thread task (0ms of longtask, vs ~2.2s for the same change before), output
+  is pixel-identical, geometry changes still rebuild, and picking still resolves to
+  the correct row afterwards.
+
+#### 4g — Skip the ipywidgets comm work at layer construction
+
+Found while profiling a real dashboard: an `A5Layer` over 359,600 cells cost
+~0.76s to *construct*, before serialization even started.
+
+- [x] Root cause: lonboard layers are ipywidgets `Widget`s, and
+  `Widget.__init__` (`ipywidgets/widgets/widget.py:506`) unconditionally calls
+  `open()`, which calls `get_state()` → every trait's `to_json` → lonboard's
+  `serialize_table_to_parquet` (ZSTD-7) over the whole table *and* every
+  accessor, purely to fill a comm-open message. Under Streamlit there is no
+  kernel, so `comm.create_comm()` returns a `DummyComm` whose `publish_msg` is
+  a no-op: the message is computed at full cost and thrown away. A second,
+  smaller instance of the same waste: `BaseLayer.__init__` ends with
+  `send_state(added_names)` for extension-injected traits, and `send_state`
+  calls `get_state()` *before* the comm check inside `_send`.
+- [x] `src/streamlit_lonboard/_widget_patch.py` overrides `open`/`send_state`
+  on `lonboard._base.BaseWidget` (layers, extensions, controls) and
+  `BaseAnyWidget` (`Map`), applied from `__init__.py` at import time.
+  Import-time rather than a context manager because layers are constructed in
+  *user* code, typically before `st_lonboard()` is ever called - a context
+  manager would only help callers who wrapped their construction. Narrow class
+  targeting rather than patching `ipywidgets.Widget` globally so any other
+  widget library in the same process is untouched. `Map`'s base must be
+  patched too: `Map.open()` serializes its `layers` trait via
+  `widget_serialization`, which reads `layer.model_id` → `comm.comm_id` and
+  would raise `AttributeError` on comm-less layers.
+- [x] Escape hatches: `STREAMLIT_LONBOARD_KEEP_WIDGET_COMM=1` (checked before
+  the patch is applied), a real-IPython-kernel check, and
+  `ipywidgets.Widget.open(widget)` to restore one widget's comm. The patch is
+  idempotent, reversible (`remove_widget_comm_patch`, used by tests), and
+  version-guarded - it warns and no-ops outside ipywidgets 8.x or if lonboard's
+  base classes stop being `Widget` subclasses.
+- [x] Side effect worth having: without a comm, `_comm_changed` never fires, so
+  layers stop being added to ipywidgets' process-global `_instances` dict.
+  Nothing drains that dict under Streamlit (`close()` only runs from `__del__`,
+  which the registry's own strong reference prevents), so every uncached layer
+  built per rerun used to leak.
+- [x] Checked whether this belongs upstream instead: lonboard 0.16.0 has no
+  headless/no-kernel mechanism at all (`get_ipython()` appears only in
+  `_environment.py` for renderer detection), so there is no supported hook to
+  use. No issue or PR filed against another repo.
+- [x] Measured with `benchmarks/bench_widget_init.py`; results in
+  `benchmarks/RESULTS.md`. Serialized output verified byte-identical with and
+  without the patch (`tests/test_widget_patch.py`).
+- Exit criteria met: 98x faster `A5Layer` construction at 200k rows, identical
+  wire bytes, `Map` construction and `close()`/GC paths unaffected.
 
 ### Phase 5 — Release
 - [x] Unit tests for `serialize.py` (`tests/test_serialize.py`, pytest). Frontend/playwright smoke tests, CI, docs site not yet done.

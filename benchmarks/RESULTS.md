@@ -342,3 +342,114 @@ something that never renders.
 - **`Map.to_html()` embedded via `components.v1.html`**: doesn't render at
   all, at any scale - a hard architectural gap in the workaround this
   project replaces, not a performance finding.
+
+## Phase 4g: skipping the ipywidgets comm at layer construction
+
+Recorded with `benchmarks/bench_widget_init.py` on an AMD Ryzen AI 9 HX 370
+(24 threads, 78 GB RAM, Fedora 6.17.8, Python 3.14.6, lonboard 0.16.0,
+ipywidgets 8.1.8). No Streamlit and no browser involved — this is pure Python
+layer-construction cost. Best of 5 per cell, single session; the two scenarios
+were measured back-to-back in the same process.
+
+How to reproduce: `uv run python benchmarks/bench_widget_init.py 200000`.
+
+| scenario (200,000 rows) | stock | patched | speedup |
+| --- | --- | --- | --- |
+| `A5Layer` (pre-built Arrow table) | 62.1 ms | 0.6 ms | 98x |
+| `ScatterplotLayer.from_geopandas` | 134.9 ms | 76.8 ms | 2x |
+
+The two rows bracket what to expect. `A5Layer` receives an Arrow table that is
+already built, so essentially *all* of its construction time was the discarded
+comm message — removing it leaves almost nothing. `from_geopandas` additionally
+converts a GeoDataFrame to Arrow and reprojects it, which the patch cannot
+remove; roughly half the time was comm overhead. Real apps land between the two
+depending on how much of the pipeline they do inside lonboard.
+
+The saving scales with table size and accessor count, because the work removed
+is a ZSTD-7 Parquet encode of the table plus every accessor column. On the
+dashboard that prompted this (A5 level 9, 359,600 cells, several accessors) the
+measured construction cost was ~0.76 s per layer, paid on every rerun that did
+not hit `@st.cache_resource`.
+
+Excluded from these numbers: serialization by `st_lonboard()` itself (unchanged
+— the payload is byte-identical with and without the patch, asserted in
+`tests/test_widget_patch.py`), and any browser-side cost.
+
+## Phase 4f: colour-only reruns
+
+Recorded with `benchmarks/bench_recolor_app.py` driven by
+`benchmarks/playwright_driver.py --recolor`, on an AMD Ryzen AI 9 HX 370 (24
+threads, 78 GB RAM, Fedora 6.17.8, Python 3.14.6), headless Chromium 149 pinned
+to the SwiftShader software GL path. Single run per cell, not averaged.
+
+The metric is **main-thread longtask total** — the sum of `PerformanceObserver`
+`longtask` entries during the rerun — not wall clock. Wall clock also contains
+Python re-serialization, transport, and GPU time; what a user experiences as "the
+tab froze" is main-thread blocking, and that is what this phase set out to remove.
+
+How to reproduce:
+
+```
+uv pip install h3
+uv run python benchmarks/playwright_driver.py --recolor h3,polygon,scatterplot --scales 160000
+```
+
+| layer | cells | first render | **recolour only** | new geometry |
+| --- | --- | --- | --- | --- |
+| `h3` (high precision) | 160,000 | 14,530 ms | **0 ms** | 2,120 ms |
+| `h3` (high precision) | 40,000 | 1,017 ms | **0 ms** | 544 ms |
+| `polygon` (GeoArrow geometry) | 40,000 | 701 ms | **0 ms** | 220 ms |
+| `scatterplot` (control) | 160,000 | 461 ms | **0 ms** | 0 ms |
+
+"New geometry" is the control that matters most: it must stay expensive. A
+recolour that costs nothing is only correct if a genuine geometry change still
+rebuilds — otherwise the map has quietly gone stale.
+
+### Measuring this correctly
+
+Two methodology traps produced badly wrong numbers before the table above:
+
+- **Waiting for the canvas is not waiting for the render.** The existing
+  `_wait_canvas_settled` only watches the canvas bounding box, which stabilises as
+  soon as the element is sized — while deck.gl still has seconds of tessellation
+  ahead of it. Timing a rerun from that point charges the *previous* render's tail
+  to it, which made a genuinely free recolour measure at 12.7 s.
+  `_wait_main_thread_quiet` now waits for the longtask stream itself to go quiet.
+- **Headless Chromium's default GL path varies.** Left unpinned it picked a
+  fallback roughly 8x slower here, enough to swamp the effect being measured. The
+  driver now passes explicit SwiftShader flags.
+
+### A5, measured directly in the browser
+
+A5 is the family that motivated this work (a 158,927-cell level-9 choropleth cost
+~8.9 s per colour change) but has no published Python bindings — only the `a5-js`
+that deck.gl itself uses — so it cannot be driven from a Streamlit app here. It was
+measured instead in a standalone page against the same deck.gl/geoarrow versions,
+instrumented to count `cellToBoundary` calls and tessellator rebuilds directly:
+
+| phase, 160,000 A5 cells | wall | longtask | `cellToBoundary` calls | tessellations |
+| --- | --- | --- | --- | --- |
+| initial render | 9,462 ms | 9,459 ms | 480,000 | 1 |
+| **recolour (same geometry)** | **37 ms** | **0 ms** | **0** | **0** |
+| geometry changed | 14,997 ms | 14,989 ms | 480,000 | 1 |
+
+The 9.5 s initial render reproduces the originally reported ~8.9 s. An A/B at
+20,000 cells with the mechanism disabled gives the direct before/after: recolour
+costs 1,067 ms of longtask and 60,000 `cellToBoundary` calls without it, 0 ms and
+0 calls with it — and the two runs produced **identical canvas hashes**, so the
+saving is pixel-for-pixel free. Picking still resolved to the correct row index
+after a recolour in both cases.
+
+### Why the benchmark forces `high_precision=True` on H3
+
+deck.gl's `H3HexagonLayer` defaults to `highPrecision: "auto"`, which instances a
+single hexagon geometry through `ColumnLayer` instead of polygonizing each cell.
+That path is cheap enough that 160,000 cells cost only ~0.6 s and the problem never
+appears at all. A5, S2 and geohash have no equivalent fast path, which is precisely
+why they were the families that hurt. Benchmarking H3 in its default mode would
+have measured the wrong thing.
+
+Excluded from these numbers: Python-side serialization (unchanged by this phase),
+and the byte-identical rerun path, where Streamlit's `ForwardMsgCache` means the
+frontend's `mount()` is never invoked (measured as 0 ms here too, and verified as
+still 0 ms after this change).

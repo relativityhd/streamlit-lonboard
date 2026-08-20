@@ -68,6 +68,12 @@ STARTUP_TIMEOUT_S = 90
 RERUN_TIMEOUT_S = 120
 SETTLE_POLL_S = 0.2
 SETTLE_STABLE_ROUNDS = 3  # consecutive stable polls before declaring "rendered"
+SOFTWARE_GL_ARGS = [
+    "--use-gl=angle",
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+    "--ignore-gpu-blocklist",
+]
 
 
 def _free_port() -> int:
@@ -77,20 +83,20 @@ def _free_port() -> int:
 
 
 @contextlib.contextmanager
-def streamlit_app(script: str, n: int, port: int):
+def streamlit_app(script: str, n: int, port: int, *, script_dir: Path = CONTENDERS_DIR, env: dict | None = None):
     proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
             "streamlit",
             "run",
-            str(CONTENDERS_DIR / script),
+            str(script_dir / script),
             "--server.headless",
             "true",
             "--server.port",
             str(port),
         ],
-        env={**os.environ, "BENCH_N": str(n)},
+        env={**os.environ, "BENCH_N": str(n), **(env or {})},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
@@ -199,6 +205,109 @@ def _drag_canvas_and_time(page: Page) -> float:
     return (time.monotonic() - start) * 1000
 
 
+# Installed before any page script runs. Phase 4f's acceptance criterion is
+# main-thread blocking time (what a user feels as "the tab froze"), which wall clock
+# around a rerun does not isolate - it also contains Python time, transport, and GPU
+# work. `longtask` entries are exactly the >50ms main-thread tasks.
+LONGTASK_OBSERVER = """
+window.__lt = [];
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) window.__lt.push(e.duration);
+}).observe({type: 'longtask', buffered: true});
+window.__ltReset = () => { window.__lt = []; };
+window.__ltSum = () => window.__lt.reduce((a, b) => a + b, 0);
+window.__ltMax = () => window.__lt.reduce((a, b) => Math.max(a, b), 0);
+"""
+
+
+def _wait_main_thread_quiet(page: Page, quiet_ms: int = 1500, timeout_s: float = 180) -> None:
+    """Wait until no new longtask has been recorded for `quiet_ms`.
+
+    `_wait_canvas_settled` only watches the canvas's bounding box, which stops
+    changing as soon as the element is sized - long before deck.gl has finished
+    deriving geometry and tessellating. Measuring a rerun without this first lets
+    the *previous* render's tail land inside the next measurement window, which is
+    enough to make a genuinely-zero-cost recolour look like tens of seconds.
+    """
+    deadline = time.monotonic() + timeout_s
+    page.evaluate("window.__ltMark = window.__lt.length")
+    quiet_since = time.monotonic()
+    while time.monotonic() < deadline:
+        grew = page.evaluate("window.__lt.length > window.__ltMark")
+        if grew:
+            page.evaluate("window.__ltMark = window.__lt.length")
+            quiet_since = time.monotonic()
+        elif (time.monotonic() - quiet_since) * 1000 >= quiet_ms:
+            return
+        time.sleep(0.25)
+
+
+def _click_and_measure_longtasks(page: Page, button: str) -> dict:
+    page.evaluate("window.__ltReset()")
+    start = time.monotonic()
+    page.get_by_role("button", name=button).click()
+    _wait_rerun_complete(page, RERUN_TIMEOUT_S)
+    _wait_main_thread_quiet(page)
+    wall_ms = (time.monotonic() - start) * 1000
+    # PerformanceObserver delivers in batches; without a settle window the last
+    # tasks of the rerun land after we read the total.
+    page.wait_for_timeout(500)
+    return {
+        "wall_ms": round(wall_ms, 1),
+        "longtask_total_ms": round(page.evaluate("window.__ltSum()"), 1),
+        "longtask_max_ms": round(page.evaluate("window.__ltMax()"), 1),
+    }
+
+
+def measure_recolor(n: int, layer: str) -> dict:
+    """Phase 4f: cost of a rerun that changes only per-row colours.
+
+    Drives `bench_recolor_app.py`, whose recolour button reassigns `get_fill_color` on
+    a cached layer so the geometry columns stay byte-identical. Reports the same three
+    numbers for a genuine geometry change, as the control: that one *must* stay
+    expensive, or the reuse path is over-matching and the map has gone stale.
+    """
+    port = _free_port()
+    with streamlit_app(
+        "bench_recolor_app.py",
+        n,
+        port,
+        script_dir=Path(__file__).parent,
+        env={"BENCH_LAYER": layer},
+    ) as base_url:
+        with sync_playwright() as pw:
+            # Pin the software GL path explicitly. Headless Chromium's default
+            # varies with what the host exposes, and the fallback it picks when
+            # left alone is dramatically slower - enough to swamp the difference
+            # this benchmark exists to measure.
+            browser = pw.chromium.launch(headless=True, args=SOFTWARE_GL_ARGS)
+            page = browser.new_page()
+            page.add_init_script(LONGTASK_OBSERVER)
+            try:
+                page.goto(base_url, wait_until="domcontentloaded")
+                _wait_script_state(page, "notRunning", STARTUP_TIMEOUT_S)
+                _wait_canvas_settled(page, STARTUP_TIMEOUT_S)
+                # The first render is the big one; it must be fully finished before
+                # any rerun is timed, or its tail is charged to that rerun.
+                _wait_main_thread_quiet(page)
+                page.wait_for_timeout(500)
+                first_render = {
+                    "longtask_total_ms": round(page.evaluate("window.__ltSum()"), 1),
+                    "longtask_max_ms": round(page.evaluate("window.__ltMax()"), 1),
+                }
+                return {
+                    "scenario": "recolor",
+                    "layer": layer,
+                    "n": n,
+                    "status": "ok",
+                    "first_render": first_render,
+                    "recolor": _click_and_measure_longtasks(page, "Rerun (recolour only)"),
+                    "new_geometry": _click_and_measure_longtasks(page, "Rerun (new geometry)"),
+                }
+            finally:
+                browser.close()
+
+
 def measure(script: str, n: int, measure_interaction: bool) -> dict:
     port = _free_port()
     with streamlit_app(script, n, port) as base_url:
@@ -269,7 +378,36 @@ def main() -> None:
     parser.add_argument("--out", default=None)
     parser.add_argument("--single", nargs=2, metavar=("SCRIPT", "N"), default=None)
     parser.add_argument("--interaction", action="store_true")
+    parser.add_argument(
+        "--recolor",
+        nargs="?",
+        const="h3,polygon,scatterplot",
+        default=None,
+        metavar="LAYERS",
+        help=(
+            "Phase 4f: measure colour-only reruns (comma-separated layer kinds for "
+            "bench_recolor_app.py). Uses --scales for sizes."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.recolor is not None:
+        results = []
+        for layer in args.recolor.split(","):
+            for n in [int(s) for s in args.scales.split(",")]:
+                print(f"--- recolor: {layer} @ {n:,} ---", file=sys.stderr)
+                try:
+                    result = measure_recolor(n, layer)
+                except Exception as e:  # noqa: BLE001 - a DNF is a valid result
+                    result = {"scenario": "recolor", "layer": layer, "n": n, "status": "DNF", "error": str(e)}
+                print(json.dumps(result), file=sys.stderr)
+                results.append(result)
+        output = json.dumps(results, indent=2)
+        if args.out:
+            Path(args.out).write_text(output)
+        else:
+            print(output)
+        return
 
     if args.single is not None:
         # Internal mode: run exactly one measurement and print its JSON result

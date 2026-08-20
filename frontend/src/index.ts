@@ -15,6 +15,7 @@ import { MapboxOverlay } from "@deck.gl/mapbox";
 import type { Table } from "apache-arrow";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+import { tagBatches } from "./columnFingerprint";
 import { type ContainerHeader, type ControlHeader, type MapOptions, parseContainer } from "./container";
 import { buildDeckLayers, type SubLayerInfo } from "./layers";
 
@@ -48,6 +49,13 @@ interface LayerCacheEntry {
   table: Table;
   deckLayers: Layer[];
   subLayerEntries: [string, SubLayerInfo][];
+  /**
+   * Per-column content fingerprints, used as `updateTriggers` values so that a
+   * rerun re-uploads only the accessor columns that actually changed. Retained
+   * alongside `table` because the props-only path below reuses that table (and
+   * its batches keep their geometry tags), so its fingerprints stay valid too.
+   */
+  columnFingerprints: Map<string, string>;
 }
 
 interface MountState {
@@ -408,9 +416,22 @@ export default async function mount(component: ComponentApi): Promise<() => void
       );
     }
 
+    // Only a freshly parsed table needs fingerprinting; a reused cached table
+    // still carries the geometry tags and fingerprints from when it was parsed.
+    let columnFingerprints: Map<string, string>;
+    if (freshTable) {
+      const markPrefix = `st-lonboard:columnFingerprints[${layerHeader.id}]`;
+      performance.mark(`${markPrefix}:start`);
+      columnFingerprints = tagBatches(freshTable, layerHeader.type);
+      performance.mark(`${markPrefix}:end`);
+      performance.measure(markPrefix, `${markPrefix}:start`, `${markPrefix}:end`);
+    } else {
+      columnFingerprints = cached!.columnFingerprints;
+    }
+
     let built: Layer[];
     try {
-      built = buildDeckLayers(layerHeader, table, state.subLayerLookup);
+      built = buildDeckLayers(layerHeader, table, state.subLayerLookup, columnFingerprints);
     } catch (error) {
       // One bad layer (e.g. a props/data mismatch) shouldn't take down every
       // other layer on the map via the BidiComponent error boundary - log and
@@ -432,6 +453,7 @@ export default async function mount(component: ComponentApi): Promise<() => void
       table,
       deckLayers: built,
       subLayerEntries,
+      columnFingerprints,
     });
   }
   state.layerCache = newLayerCache;
