@@ -121,23 +121,28 @@ export function geometryColumnNames(schema: Schema, layerType: string): string[]
  * Fingerprint every column of `table`, and tag each of its batches with the combined
  * fingerprint of its geometry columns.
  *
- * Returns column name -> fingerprint, for use as `updateTriggers` values. (Tables from
+ * Returns column name -> fingerprint, for use as `updateTriggers` values. Tables from
  * this component always hold exactly one batch - `serialize.py` calls
- * `combine_chunks()` before writing IPC - but nothing here depends on that.)
+ * `combine_chunks()` before writing IPC - but this stays correct for several, because
+ * every part below is joined with an explicit separator rather than run together: two
+ * different chunk or batch splits of the same overall content must not be able to
+ * concatenate to the same fingerprint, or a changed column would look unchanged.
  */
 export function tagBatches(table: Table, layerType: string): Map<string, string> {
   const geometryNames = new Set(geometryColumnNames(table.schema, layerType));
-  const perColumn = new Map<string, string>();
+  const perColumnParts = new Map<string, string[]>();
 
   for (const batch of table.batches) {
     const geometryParts: string[] = [];
     for (const field of batch.schema.fields) {
       const column = batch.getChild(field.name);
       if (!column) continue;
-      const fingerprint = column.data.map(fingerprintData).join("");
+      const fingerprint = column.data.map(fingerprintData).join("|");
       // Batches are fingerprinted independently, so a multi-batch table's per-column
-      // entry is the concatenation across batches.
-      perColumn.set(field.name, (perColumn.get(field.name) ?? "") + fingerprint);
+      // entry is the joined sequence across batches, in batch order.
+      const parts = perColumnParts.get(field.name);
+      if (parts) parts.push(fingerprint);
+      else perColumnParts.set(field.name, [fingerprint]);
       if (geometryNames.has(field.name)) geometryParts.push(`${field.name}:${fingerprint}`);
     }
     // No geometry columns (an unknown or malformed layer) means we cannot prove the
@@ -147,5 +152,5 @@ export function tagBatches(table: Table, layerType: string): Map<string, string>
     }
   }
 
-  return perColumn;
+  return new Map(Array.from(perColumnParts, ([name, parts]) => [name, parts.join("|")]));
 }

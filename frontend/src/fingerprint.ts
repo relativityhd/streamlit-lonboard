@@ -48,9 +48,18 @@ export function fnv1aInto(hash1: number, hash2: number, bytes: Uint8Array): [num
   return [h1, h2];
 }
 
-/** Render a `fnv1aInto` lane pair as a stable hex string. */
+/**
+ * Render a `fnv1aInto` lane pair as a stable hex string.
+ *
+ * Both lanes are zero-padded to their full 8 digits. `toString(16)` emits 1-8 digits,
+ * so without padding the boundary between the lanes floats and distinct pairs can
+ * render to the same string - `toHex(0x1, 0x23)` and `toHex(0x12, 0x3)` would both be
+ * "123" - handing back at the encoding layer exactly the collision margin the second
+ * lane exists to buy. Padding also makes every fingerprint fixed-width, which is what
+ * lets callers concatenate fingerprints without ambiguity.
+ */
 export function toHex(hash1: number, hash2: number): string {
-  return `${(hash1 >>> 0).toString(16)}${(hash2 >>> 0).toString(16)}`;
+  return `${(hash1 >>> 0).toString(16).padStart(8, "0")}${(hash2 >>> 0).toString(16).padStart(8, "0")}`;
 }
 
 /**
