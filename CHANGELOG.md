@@ -19,6 +19,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reruns that change only per-row accessor columns (colours, radii, widths) no
+  longer re-tessellate. The frontend fingerprints each Arrow column's contents
+  after parsing and tags each record batch with the fingerprint of its
+  geometry-bearing columns; a `dataComparator` then lets deck.gl recognise a
+  new-but-identical geometry as unchanged, while per-column `updateTriggers`
+  re-upload exactly the accessors that differ. Measured on 160,000
+  high-precision H3 cells: a colour-only rerun drops from ~2.2s of blocked main
+  thread to 0ms, rendering pixel-identical output; on 160,000 A5 cells the
+  equivalent full rebuild costs ~9s. Genuine geometry changes still rebuild, and
+  picking/tooltips still resolve against the current data. No wire-format change
+  — the Python package and its `frontend_dist` do **not** need to be upgraded in
+  lockstep for this.
+- Importing `streamlit_lonboard` now stops lonboard's widgets from serializing
+  their state for a Jupyter comm that cannot exist under Streamlit. lonboard
+  layers are ipywidgets `Widget`s, and `Widget.__init__` unconditionally calls
+  `open()`, which Parquet-encodes the whole table plus every accessor column to
+  fill a comm-open message that a kernel-less environment discards. Constructing
+  an `A5Layer` over 200k rows drops from 62ms to 0.6ms; a
+  `ScatterplotLayer.from_geopandas` at the same scale roughly halves (the
+  GeoDataFrame → Arrow conversion is real work that remains). The serialized
+  payload is byte-for-byte identical either way. Layers also stop accumulating
+  in ipywidgets' process-global `_instances` registry, which nothing drains
+  under Streamlit. Set `STREAMLIT_LONBOARD_KEEP_WIDGET_COMM=1` before importing
+  to opt out; the patch version-guards itself and no-ops with a warning if
+  ipywidgets/lonboard internals move. Known consequence: patched widgets have
+  no `comm`/`model_id`, so `Map.to_html()` raises unless you opt out or call
+  `ipywidgets.Widget.open(widget)` first.
+
 ## [0.2.0] - 2026-08-20
 
 ### Added
@@ -57,36 +87,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data is silently skipped). Falls back to the passed `map`'s `show_tooltip`
   when `tooltip` is left at its default `False`. Requires `pickable=True` on
   the layer (lonboard's own default).
-
-### Changed
-
-- Reruns that change only per-row accessor columns (colours, radii, widths) no
-  longer re-tessellate. The frontend fingerprints each Arrow column's contents
-  after parsing and tags each record batch with the fingerprint of its
-  geometry-bearing columns; a `dataComparator` then lets deck.gl recognise a
-  new-but-identical geometry as unchanged, while per-column `updateTriggers`
-  re-upload exactly the accessors that differ. Measured on 160,000
-  high-precision H3 cells: a colour-only rerun drops from ~2.2s of blocked main
-  thread to 0ms, rendering pixel-identical output; on 160,000 A5 cells the
-  equivalent full rebuild costs ~9s. Genuine geometry changes still rebuild, and
-  picking/tooltips still resolve against the current data. No wire-format change
-  — the Python package and its `frontend_dist` do **not** need to be upgraded in
-  lockstep for this.
-- Importing `streamlit_lonboard` now stops lonboard's widgets from serializing
-  their state for a Jupyter comm that cannot exist under Streamlit. lonboard
-  layers are ipywidgets `Widget`s, and `Widget.__init__` unconditionally calls
-  `open()`, which Parquet-encodes the whole table plus every accessor column to
-  fill a comm-open message that a kernel-less environment discards. Constructing
-  an `A5Layer` over 200k rows drops from 62ms to 0.6ms; a
-  `ScatterplotLayer.from_geopandas` at the same scale roughly halves (the
-  GeoDataFrame → Arrow conversion is real work that remains). The serialized
-  payload is byte-for-byte identical either way. Layers also stop accumulating
-  in ipywidgets' process-global `_instances` registry, which nothing drains
-  under Streamlit. Set `STREAMLIT_LONBOARD_KEEP_WIDGET_COMM=1` before importing
-  to opt out; the patch version-guards itself and no-ops with a warning if
-  ipywidgets/lonboard internals move. Known consequence: patched widgets have
-  no `comm`/`model_id`, so `Map.to_html()` raises unless you opt out or call
-  `ipywidgets.Widget.open(widget)` first.
 
 ### Fixed
 
