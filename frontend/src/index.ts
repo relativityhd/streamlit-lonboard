@@ -355,11 +355,12 @@ export default async function mount(component: ComponentApi): Promise<() => void
     }
   }
 
-  // parseContainer is async because a gzip-compressed payload
-  // (compression="auto"/"gzip" in st_lonboard()) needs to go through the
-  // browser's native (Promise-based) DecompressionStream before it can be
-  // sliced into per-layer Arrow IPC ranges. CCv2 awaits this default export,
-  // so an async mount() is supported (confirmed against the bundled runtime).
+  // parseContainer is async for three reasons, any of which can apply to a
+  // given payload: a gzip-compressed body (compression="gzip") goes through
+  // the browser's native (Promise-based) DecompressionStream; a zstd layer
+  // needs its WASM codec instantiated before Arrow parsing; and a Parquet
+  // layer is decoded by parquet-wasm. CCv2 awaits this default export, so an
+  // async mount() is supported (confirmed against the bundled runtime).
   const { header, layers } = await parseContainer(bytes, previousBytesFingerprints);
   const state = existingState ?? createMount(component, header);
   state.mapOptions = header.mapOptions;

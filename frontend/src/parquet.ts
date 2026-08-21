@@ -34,9 +34,10 @@ function ensureParquetWasm(): Promise<unknown> {
  * parquet-wasm's default `batchSize` is 1024 rows, which would fragment a
  * 1M-row layer into ~1000 record batches - each becoming a separate chunk in
  * the parsed Arrow table and a separate render pass in the GeoArrow deck.gl
- * layers. A huge batch size instead yields one batch per Parquet row group
- * (pyarrow's writer defaults to ~1M-row row groups), matching the
- * single-record-batch layout the plain-IPC path ships.
+ * layers. A huge batch size instead yields one batch per Parquet row group,
+ * and `_table_to_parquet_bytes` pins the writer to a single row group per
+ * layer, so this reconstructs the same single-record-batch layout the
+ * plain-IPC path ships.
  */
 const READ_ALL_ONE_BATCH = 0x7fffffff;
 

@@ -4,9 +4,8 @@
   "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "dev": "npm run copy-wasm && vite build --watch",
-    "build": "vite build && npm run copy-wasm",
-    "copy-wasm": "cp node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm ../src/streamlit_lonboard/frontend_dist/"
+    "dev": "vite build --watch",
+    "build": "vite build"
   },
   "dependencies": {
     "@deck.gl/aggregation-layers": "^9.3.6",

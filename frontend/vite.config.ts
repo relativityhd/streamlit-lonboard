@@ -1,3 +1,4 @@
+import { copyFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { defineConfig } from "vite";
 import license from "rollup-plugin-license";
@@ -14,6 +15,23 @@ export default defineConfig({
     process: JSON.stringify({ env: { NODE_ENV: "production" } }),
   },
   plugins: [
+    // Copies parquet-wasm's binary next to index.js, where src/parquet.ts
+    // fetches it from at runtime. This runs as a build hook rather than a
+    // separate npm step because `emptyOutDir: true` below wipes outDir at the
+    // *start* of every build: a `cp` sequenced before the build (as `npm run
+    // dev` originally did) gets deleted by it, and one sequenced after only
+    // covers a single build, not the rebuilds `vite build --watch` performs.
+    // `closeBundle` fires after each write, so both `build` and `dev` stay
+    // correct.
+    {
+      name: "copy-parquet-wasm",
+      closeBundle() {
+        copyFileSync(
+          resolve(__dirname, "node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm"),
+          resolve(__dirname, "../src/streamlit_lonboard/frontend_dist/parquet_wasm_bg.wasm"),
+        );
+      },
+    },
     // parquet-wasm's wasm-bindgen glue contains a
     // `new URL('parquet_wasm_bg.wasm', import.meta.url)` fallback for when no
     // explicit wasm location is passed to init. Vite statically detects that

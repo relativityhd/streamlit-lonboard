@@ -1,7 +1,11 @@
 /**
  * Parses the binary payload built by `streamlit_lonboard.serialize.pack_payload`.
  *
- * Layout: `<u32 header_len little-endian><utf-8 json header><concatenated ipc streams>`.
+ * Layout: `<u32 header_len little-endian><utf-8 json header><concatenated
+ * per-layer bodies>`, where each body is an Arrow IPC stream (optionally with
+ * ZSTD-compressed buffers) or a Parquet file, per that layer's
+ * `bodyEncoding`. The whole body is additionally gzipped as one blob when
+ * `header.compression === "gzip"`.
  * See serialize.py for why this custom framing exists instead of relying on
  * CCv2's automatic dataframe-in-dict serialization.
  */
@@ -155,9 +159,10 @@ export interface ParsedContainer {
 async function decompressGzip(bytes: Uint8Array): Promise<Uint8Array> {
   if (typeof DecompressionStream === "undefined") {
     throw new Error(
-      "streamlit-lonboard: this payload is gzip-compressed (compression='gzip'/'auto' in " +
+      "streamlit-lonboard: this payload is gzip-compressed (compression='gzip' in " +
         "st_lonboard()), but this browser has no DecompressionStream support. Pass " +
-        "compression=None to st_lonboard() to disable compression, or use a modern browser.",
+        "compression='auto' (the default, which never uses gzip) or compression=None " +
+        "to st_lonboard(), or use a modern browser.",
     );
   }
   // TS types Uint8Array.buffer as ArrayBuffer | SharedArrayBuffer; ours is

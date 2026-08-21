@@ -13,7 +13,10 @@ Design (see IMPLEMENTATION_PLAN.md §2):
   Arrow version used for parsing, we instead ship everything as a single
   top-level `bytes` payload (the one shape CCv2 forwards verbatim) with a
   small custom framing: a 4-byte little-endian header length, a UTF-8 JSON
-  header, then the concatenated per-layer Arrow IPC streams.
+  header, then the concatenated per-layer bodies. Each body is an Arrow IPC
+  stream or a Parquet file, per that layer's `bodyEncoding` (see
+  `BodyEncoding`); the whole body may additionally be gzipped as one blob
+  when `compression="gzip"`.
 """
 
 from __future__ import annotations
@@ -533,6 +536,15 @@ def _table_to_parquet_bytes(table: pa.Table) -> bytes:
         # Leaves in neither list are written plain (no dictionary, no BSS).
         use_dictionary=dict_leaves,
         use_byte_stream_split=bss_leaves,
+        # One row group for the whole layer, so the frontend reconstructs a
+        # single record batch - the same shape `combine_chunks()` guarantees
+        # for the IPC path, and what the rest of the frontend is written
+        # against (see frontend/src/columnFingerprint.ts). Left unpinned,
+        # pyarrow splits every ~1,048,576 rows, and since this encoding only
+        # engages past AUTO_PARQUET_THRESHOLD the split would fire on
+        # essentially every Parquet payload: a 24MB/1.5M-row table measured 2
+        # row groups, i.e. 2 batches and 2 deck.gl sub-layers per layer.
+        row_group_size=max(table.num_rows, 1),
     )
     return sink.getvalue()
 
