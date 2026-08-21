@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-21
+
 ### Changed
 
 - `st_lonboard(compression=...)` gained two wire formats and changed what its
