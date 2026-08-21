@@ -1,3 +1,4 @@
+import { copyFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { defineConfig } from "vite";
 import license from "rollup-plugin-license";
@@ -13,6 +14,48 @@ export default defineConfig({
   define: {
     process: JSON.stringify({ env: { NODE_ENV: "production" } }),
   },
+  plugins: [
+    // Copies parquet-wasm's binary next to index.js, where src/parquet.ts
+    // fetches it from at runtime. This runs as a build hook rather than a
+    // separate npm step because `emptyOutDir: true` below wipes outDir at the
+    // *start* of every build: a `cp` sequenced before the build (as `npm run
+    // dev` originally did) gets deleted by it, and one sequenced after only
+    // covers a single build, not the rebuilds `vite build --watch` performs.
+    // `closeBundle` fires after each write, so both `build` and `dev` stay
+    // correct.
+    {
+      name: "copy-parquet-wasm",
+      closeBundle() {
+        copyFileSync(
+          resolve(__dirname, "node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm"),
+          resolve(__dirname, "../src/streamlit_lonboard/frontend_dist/parquet_wasm_bg.wasm"),
+        );
+      },
+    },
+    // parquet-wasm's wasm-bindgen glue contains a
+    // `new URL('parquet_wasm_bg.wasm', import.meta.url)` fallback for when no
+    // explicit wasm location is passed to init. Vite statically detects that
+    // pattern and - in lib mode, where assets are force-inlined - embeds the
+    // entire 6.5MB binary as base64 into index.js. Our loader
+    // (src/parquet.ts) always passes an explicit URL, so the fallback is dead
+    // code; strip it before vite's asset detection sees it, keeping the WASM
+    // a separate lazily-fetched file (copied by the `copy-wasm` npm script).
+    {
+      name: "strip-parquet-wasm-url-fallback",
+      transform(code: string, id: string) {
+        if (!id.includes("parquet_wasm.js")) return null;
+        const fallback = "new URL('parquet_wasm_bg.wasm', import.meta.url)";
+        if (!code.includes(fallback)) {
+          this.error(
+            "parquet-wasm glue no longer contains the expected wasm-URL fallback - " +
+              "update strip-parquet-wasm-url-fallback in vite.config.ts for the new pattern " +
+              "(otherwise the 6.5MB binary gets base64-inlined into index.js again).",
+          );
+        }
+        return code.replace(fallback, "undefined");
+      },
+    },
+  ],
   build: {
     outDir: resolve(__dirname, "../src/streamlit_lonboard/frontend_dist"),
     emptyOutDir: true,

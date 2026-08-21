@@ -13,7 +13,10 @@ Design (see IMPLEMENTATION_PLAN.md §2):
   Arrow version used for parsing, we instead ship everything as a single
   top-level `bytes` payload (the one shape CCv2 forwards verbatim) with a
   small custom framing: a 4-byte little-endian header length, a UTF-8 JSON
-  header, then the concatenated per-layer Arrow IPC streams.
+  header, then the concatenated per-layer bodies. Each body is an Arrow IPC
+  stream or a Parquet file, per that layer's `bodyEncoding` (see
+  `BodyEncoding`); the whole body may additionally be gzipped as one blob
+  when `compression="gzip"`.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from weakref import WeakKeyDictionary, WeakSet
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.ipc
+import pyarrow.parquet as pq
 import traitlets
 
 from ._perf import log, span
@@ -41,7 +45,64 @@ _EXTENSION_NAME_KEY = b"ARROW:extension:name"
 # loudly instead of mis-parsing.
 PAYLOAD_FORMAT_VERSION = 1
 
-Compression = Literal["auto", "gzip"] | None
+Compression = Literal["auto", "gzip", "zstd", "parquet"] | None
+
+# How one layer's table is encoded into its byte range of the payload body:
+# - "ipc": plain Arrow IPC stream (compression None, or "gzip", which gzips
+#   the *whole body* after concatenation rather than the streams).
+# - "ipc-zstd": Arrow IPC stream with ZSTD-compressed record-batch body
+#   buffers (the IPC spec's own per-buffer compression) - decompressed
+#   transparently inside the frontend's `tableFromIPC` via a registered codec.
+# - "parquet": a complete Parquet file (ZSTD data pages), decoded in the
+#   frontend by parquet-wasm back into Arrow.
+BodyEncoding = Literal["ipc", "ipc-zstd", "parquet"]
+
+# What `compression=` asks for, before per-layer resolution. "auto" is not a
+# wire encoding: it picks one of the three above per layer, once that layer's
+# table size is known (see `resolve_body_encoding`).
+RequestedBodyEncoding = Literal["ipc", "ipc-zstd", "parquet", "auto"]
+
+
+def body_encoding_for(compression: Compression) -> RequestedBodyEncoding:
+    """Map the user-facing `compression=` option to a requested body encoding."""
+    if compression == "zstd":
+        return "ipc-zstd"
+    if compression == "parquet":
+        return "parquet"
+    if compression == "auto":
+        return "auto"
+    if compression in (None, "gzip"):
+        return "ipc"
+    raise ValueError(
+        f"st_lonboard: compression={compression!r} is not supported; use 'auto', 'gzip', 'zstd', 'parquet', or None"
+    )
+
+
+def resolve_body_encoding(requested: RequestedBodyEncoding, table: pa.Table) -> BodyEncoding:
+    """Resolve a requested encoding against one layer's finished table.
+
+    Only "auto" depends on the table; it has three tiers, keyed on
+    `table.nbytes` (the in-memory footprint, a close proxy for the IPC stream
+    size, so nothing has to be encoded twice just to measure it):
+
+    - below `AUTO_COMPRESSION_THRESHOLD`: plain "ipc". Compression can't pay
+      for itself, and this tier never pulls parquet-wasm.
+    - up to `AUTO_PARQUET_THRESHOLD`: "ipc-zstd" - the fastest decode of any
+      compressed mode measured, near-free to encode, and it adds no network
+      request at all (its decoder is bundled).
+    - at or above `AUTO_PARQUET_THRESHOLD`: "parquet", whose ~20% better
+      ratio starts to outweigh both its slower encode/decode and its
+      one-time WASM download.
+    """
+    if requested != "auto":
+        return requested
+    nbytes = table.nbytes
+    if nbytes >= AUTO_PARQUET_THRESHOLD:
+        return "parquet"
+    if nbytes >= AUTO_COMPRESSION_THRESHOLD:
+        return "ipc-zstd"
+    return "ipc"
+
 
 # `st_lonboard(tooltip=...)`: `True` ships every available non-geometry,
 # non-accessor column; a tuple of names ships only those (best-effort - a
@@ -50,14 +111,25 @@ Compression = Literal["auto", "gzip"] | None
 # different layers commonly have different schemas); `False` ships none.
 TooltipSpec = bool | tuple[str, ...]
 
-# "auto" compresses only above this many raw body bytes. Below it, gzip's
-# fixed CPU cost (compress here, decompress + extra round trip in the
-# browser) isn't worth the transfer savings - and on localhost, IPC transfer
-# is fast enough that even large payloads often aren't worth compressing
-# (see IMPLEMENTATION_PLAN.md §2 and Phase 4d). Chosen so the 10k-point
-# baseline (~233KB, see benchmarks/RESULTS.md) stays uncompressed by default
-# while 100k+ (~2.3MB+) does not.
+# Per layer, "auto" leaves the table uncompressed below this many in-memory
+# bytes: the encode/decode CPU is pure overhead on localhost, where transfer
+# is free (see IMPLEMENTATION_PLAN.md §2 and Phase 4d). Chosen so the
+# 10k-point baseline (~233KB, see benchmarks/RESULTS.md) stays uncompressed
+# by default while 100k+ (~2.3MB+) does not.
 AUTO_COMPRESSION_THRESHOLD = 1_000_000
+
+# ...and only reaches for Parquet at this size. Between the two thresholds
+# "auto" ships ZSTD-compressed Arrow IPC instead, which decodes ~3x faster
+# than Parquet and needs no extra download, at ~20% more bytes on the wire
+# (measured in benchmarks/RESULTS.md Phase 4k).
+#
+# This is a deliberately conservative "bandwidth clearly dominates" line, not
+# a measured crossover: the two modes' CPU and size costs both scale with the
+# payload, so their true break-even sits near a *link speed* (~50-60 Mbps on
+# the real-data scenarios) rather than a byte count. What a byte count does
+# capture is that the fixed ~1.8MB (gzipped) parquet-wasm download amortizes
+# in ~2 reruns at this size, versus ~3-4 at the lower threshold.
+AUTO_PARQUET_THRESHOLD = 20_000_000
 
 # lonboard `_layer_type` -> frontend GeoArrow*Layer tag (see frontend/src/layers.ts)
 SUPPORTED_LAYER_TYPES = {
@@ -212,9 +284,9 @@ def _geometry_column_names(schema: pa.Schema) -> list[str]:
 class SerializedLayer:
     """One lonboard layer, ready to be packed into the wire payload.
 
-    `ipc_bytes` is precomputed (not derived from `table` on demand) so that
+    `body_bytes` is precomputed (not derived from `table` on demand) so that
     caching a `SerializedLayer` (see `serialize_layer_cached`) also caches the
-    Arrow IPC write, not just the table-building step.
+    Arrow IPC / Parquet write, not just the table-building step.
     """
 
     layer_id: str
@@ -228,7 +300,14 @@ class SerializedLayer:
     tooltip_request: TooltipSpec
     tooltip_columns: tuple[str, ...]
     table: pa.Table
-    ipc_bytes: bytes
+    # What `compression=` asked for (the cache-hit comparison in
+    # `serialize_layer_cached`, since changing `compression=` between reruns
+    # must re-encode even when the table itself didn't change) and what that
+    # resolved to for *this* layer - they differ only for "auto", which is
+    # decided per layer against `table.nbytes` (see `resolve_body_encoding`).
+    encoding_request: RequestedBodyEncoding
+    encoding: BodyEncoding
+    body_bytes: bytes
 
 
 def build_layer_props(layer: Any) -> tuple[dict[str, Any], dict[str, pa.ChunkedArray]]:
@@ -381,8 +460,16 @@ def _canonicalize_table(table: pa.Table) -> pa.Table:
     return pa.Table.from_arrays(table.columns, schema=schema)
 
 
-def _table_to_ipc_bytes(table: pa.Table) -> bytes:
+def _table_to_ipc_bytes(table: pa.Table, *, buffer_compression: str | None = None) -> bytes:
     """Write `table` as a single-record-batch Arrow IPC stream.
+
+    `buffer_compression="zstd"` enables the IPC spec's per-buffer body
+    compression (each record-batch buffer compressed independently, with an
+    8-byte uncompressed-length prefix). pyarrow's C++ writer always compresses
+    every buffer when this is set (it has no "store uncompressed if bigger"
+    fallback unless `min_space_savings` is configured, which we don't) - which
+    matters because the frontend's registered decode codec only handles the
+    compressed case (see frontend/src/container.ts).
 
     `combine_chunks()` first: lonboard auto-rechunks large tables (via
     arro3's Rust rechunk), which produces zero-copy slices - each chunk after
@@ -402,9 +489,105 @@ def _table_to_ipc_bytes(table: pa.Table) -> bytes:
     """
     table = table.combine_chunks()
     sink = io.BytesIO()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
+    options = pa.ipc.IpcWriteOptions(compression=buffer_compression)
+    with pa.ipc.new_stream(sink, table.schema, options=options) as writer:
         writer.write_table(table)
     return sink.getvalue()
+
+
+def _table_to_parquet_bytes(table: pa.Table) -> bytes:
+    """Write `table` as a complete in-memory Parquet file (ZSTD data pages).
+
+    pyarrow stores the full Arrow schema (including the GeoArrow extension
+    field metadata the frontend's layer builders key on) in the Parquet
+    footer's `ARROW:schema` key by default (`store_schema=True`), and
+    parquet-wasm's Rust reader reconstructs it faithfully - verified against
+    a `geoarrow.point` column with CRS metadata.
+
+    `combine_chunks()` for the same sliced-offsets reason as
+    `_table_to_ipc_bytes` (the Parquet writer goes through the same C++
+    write path that mis-handles lazily-sliced list offsets).
+
+    Encoding choice (measured in benchmarks/wire_options.py and
+    wire_options_real.py, see benchmarks/RESULTS.md): per leaf column,
+    - *flat and point-like* numeric leaves (max_repetition_level <= 1:
+      scalar stats/accessors, point coordinates, fixed-size color lists)
+      get BYTE_STREAM_SPLIT, which regroups each value's bytes by
+      significance before compression - the only encoding here that
+      shrinks high-entropy float coordinate buffers (~21% under raw IPC on
+      the synthetic scatter benchmark, where dictionary+plain-ZSTD Parquet
+      came out *larger* than raw IPC);
+    - *deeply-nested* numeric leaves (max_repetition_level > 1: Path/
+      Polygon/MultiPolygon vertex coordinates) get plain+ZSTD instead.
+      Real boundary geometry repeats vertices across neighboring features,
+      and ZSTD exploits those byte-sequence repeats directly - BSS's byte
+      transposition destroys them (measured on real A5 pentagon polygons:
+      BSS 3.10MB vs. plain 1.79MB vs. 4.37MB raw at L07);
+    - everything else (string/binary tooltip columns) keeps dictionary
+      encoding (BSS and dictionary are mutually exclusive per column).
+    """
+    table = table.combine_chunks()
+    bss_leaves, dict_leaves = _split_parquet_leaf_paths(table.schema)
+    sink = io.BytesIO()
+    pq.write_table(
+        table,
+        sink,
+        compression="zstd",
+        # Leaves in neither list are written plain (no dictionary, no BSS).
+        use_dictionary=dict_leaves,
+        use_byte_stream_split=bss_leaves,
+        # One row group for the whole layer, so the frontend reconstructs a
+        # single record batch - the same shape `combine_chunks()` guarantees
+        # for the IPC path, and what the rest of the frontend is written
+        # against (see frontend/src/columnFingerprint.ts). Left unpinned,
+        # pyarrow splits every ~1,048,576 rows, and since this encoding only
+        # engages past AUTO_PARQUET_THRESHOLD the split would fire on
+        # essentially every Parquet payload: a 24MB/1.5M-row table measured 2
+        # row groups, i.e. 2 batches and 2 deck.gl sub-layers per layer.
+        row_group_size=max(table.num_rows, 1),
+    )
+    return sink.getvalue()
+
+
+def _split_parquet_leaf_paths(schema: pa.Schema) -> tuple[list[str], list[str]]:
+    """Partition a schema's Parquet leaf-column paths into (BSS leaves,
+    dictionary leaves) per the policy documented in `_table_to_parquet_bytes`;
+    numeric leaves nested deeper than one repetition level land in neither
+    list and are written plain.
+
+    Path strings must match what the Parquet writer expects for nested
+    columns (e.g. a GeoArrow point column becomes "geometry.list.element"),
+    so they're read back from an actual (zero-row, in-memory) Parquet write
+    of the schema rather than reconstructed by hand from the Arrow schema -
+    which also provides each leaf's max_repetition_level directly.
+    """
+    sink = io.BytesIO()
+    pq.write_table(schema.empty_table(), sink)
+    parquet_schema = pq.ParquetFile(pa.BufferReader(sink.getvalue())).schema
+    bss: list[str] = []
+    dictionary: list[str] = []
+    for i in range(len(parquet_schema)):
+        column = parquet_schema.column(i)
+        # The physical types BYTE_STREAM_SPLIT supports, minus
+        # FIXED_LEN_BYTE_ARRAY (half-precision floats etc. - none of our
+        # columns produce it, and BSS gains there are unproven).
+        if column.physical_type in ("FLOAT", "DOUBLE", "INT32", "INT64"):
+            if column.max_repetition_level <= 1:
+                bss.append(column.path)
+            # else: deeply-nested coordinates, written plain - see docstring.
+        else:
+            dictionary.append(column.path)
+    return bss, dictionary
+
+
+def _encode_table(table: pa.Table, encoding: BodyEncoding) -> bytes:
+    if encoding == "ipc":
+        return _table_to_ipc_bytes(table)
+    if encoding == "ipc-zstd":
+        return _table_to_ipc_bytes(table, buffer_compression="zstd")
+    if encoding == "parquet":
+        return _table_to_parquet_bytes(table)
+    raise ValueError(f"unknown body encoding {encoding!r}")
 
 
 def _rescale_trip_timestamps(chunked: pa.ChunkedArray) -> pa.ChunkedArray:
@@ -424,7 +607,9 @@ def _rescale_trip_timestamps(chunked: pa.ChunkedArray) -> pa.ChunkedArray:
     return pa.chunked_array([rescaled])
 
 
-def serialize_layer(layer: Any, layer_id: str, tooltip: TooltipSpec = False) -> SerializedLayer:
+def serialize_layer(
+    layer: Any, layer_id: str, tooltip: TooltipSpec = False, encoding: RequestedBodyEncoding = "auto"
+) -> SerializedLayer:
     """Serialize a single lonboard layer into scalar props + a minimal Arrow table.
 
     Not cached - see `serialize_layer_cached` for the memoized entry point
@@ -467,7 +652,8 @@ def serialize_layer(layer: Any, layer_id: str, tooltip: TooltipSpec = False) -> 
             out_table = out_table.append_column(name, table.column(name))
 
         out_table = _canonicalize_table(out_table)
-        ipc_bytes = _table_to_ipc_bytes(out_table)
+        resolved_encoding = resolve_body_encoding(encoding, out_table)
+        body_bytes = _encode_table(out_table, resolved_encoding)
 
         return SerializedLayer(
             layer_id=layer_id,
@@ -477,7 +663,9 @@ def serialize_layer(layer: Any, layer_id: str, tooltip: TooltipSpec = False) -> 
             tooltip_request=tooltip,
             tooltip_columns=tooltip_columns,
             table=out_table,
-            ipc_bytes=ipc_bytes,
+            encoding_request=encoding,
+            encoding=resolved_encoding,
+            body_bytes=body_bytes,
         )
 
 
@@ -512,24 +700,31 @@ def _evict_cache_for_extension_trait_change(change: dict[str, Any]) -> None:
         _layer_cache.pop(layer, None)
 
 
-def serialize_layer_cached(layer: Any, layer_id: str, tooltip: TooltipSpec = False) -> SerializedLayer:
+def serialize_layer_cached(
+    layer: Any, layer_id: str, tooltip: TooltipSpec = False, encoding: RequestedBodyEncoding = "auto"
+) -> SerializedLayer:
     """Like `serialize_layer`, but memoized on layer object identity.
 
-    A cache hit skips table-building *and* the Arrow IPC write entirely.
-    Invalidated automatically if any trait on the layer changes (lonboard
-    layers are traitlets `HasTraits` instances), if any trait on one of its
-    `extensions` changes, if `tooltip` differs from what this layer was last
-    serialized with (a plain equality check against the request - like
-    `layer_id`, this needs no `layer.table` access, so a cache *hit* never
-    pays for it), or if the same object is reused at a different `layer_id`
-    (e.g. the app reordered its layers list).
+    A cache hit skips table-building *and* the Arrow IPC/Parquet write
+    entirely. Invalidated automatically if any trait on the layer changes
+    (lonboard layers are traitlets `HasTraits` instances), if any trait on one
+    of its `extensions` changes, if `tooltip` or `encoding` differs from what
+    this layer was last serialized with (plain equality checks against the
+    request - like `layer_id`, these need no `layer.table` access, so a cache
+    *hit* never pays for them), or if the same object is reused at a different
+    `layer_id` (e.g. the app reordered its layers list).
     """
     cached = _layer_cache.get(layer)
-    if cached is not None and cached.layer_id == layer_id and cached.tooltip_request == tooltip:
+    if (
+        cached is not None
+        and cached.layer_id == layer_id
+        and cached.tooltip_request == tooltip
+        and cached.encoding_request == encoding
+    ):
         log("serialize_layer_cached[%s]: hit", layer_id)
         return cached
 
-    serialized = serialize_layer(layer, layer_id, tooltip)
+    serialized = serialize_layer(layer, layer_id, tooltip, encoding)
     _layer_cache[layer] = serialized
     if layer not in _observed_layers:
         layer.observe(_evict_cache_on_trait_change, names=traitlets.All)
@@ -552,14 +747,16 @@ def _compress_body(body: bytes, compression: Compression) -> tuple[bytes, str | 
     *uncompressed* body before this runs, so the frontend must decompress the
     whole body before slicing per-layer ranges out of it (see container.ts).
     """
-    if compression is None:
+    if compression in (None, "auto", "zstd", "parquet"):
+        # Every mode except "gzip" compresses inside each layer's own body
+        # bytes (see `BodyEncoding`) - no whole-body pass on top. "auto"
+        # included: it now reaches for Parquet per layer rather than gzipping
+        # the concatenated body (see `resolve_body_encoding`).
         return body, None
-    if compression == "auto":
-        if len(body) < AUTO_COMPRESSION_THRESHOLD:
-            return body, None
-        compression = "gzip"
     if compression != "gzip":
-        raise ValueError(f"st_lonboard: compression={compression!r} is not supported; use 'auto', 'gzip', or None")
+        raise ValueError(
+            f"st_lonboard: compression={compression!r} is not supported; use 'auto', 'gzip', 'zstd', 'parquet', or None"
+        )
 
     with span("pack_payload.compress"):
         compressed = gzip.compress(body, compresslevel=6)
@@ -580,27 +777,46 @@ def pack_payload(
 ) -> bytes:
     """Pack layers + view state + map options into a single framed `bytes` blob.
 
-    Layout: `<u32 header_len little-endian><utf-8 json header><concatenated ipc streams,
-    gzip-compressed as a whole if header["compression"] == "gzip">`.
+    Layout: `<u32 header_len little-endian><utf-8 json header><concatenated
+    per-layer body byte ranges (Arrow IPC streams or Parquet files, per that
+    layer's header["bodyEncoding"]), gzip-compressed as a whole if
+    header["compression"] == "gzip">`.
+
+    `bodyEncoding` is per *layer* rather than per payload because "auto"
+    resolves against each layer's own table size, so one map can legitimately
+    mix a Parquet-encoded 2M-row layer with a plain-IPC 500-row one.
     """
+    requested_encoding = body_encoding_for(compression)
     with span("pack_payload"):
         body = io.BytesIO()
         layer_headers = []
         for layer in serialized_layers:
-            ipc_bytes = layer.ipc_bytes
+            if layer.encoding_request != requested_encoding:
+                # A stale-cache/programming error, not a user error: component.py
+                # derives both from the same `compression=` argument.
+                raise ValueError(
+                    f"pack_payload: layer {layer.layer_id!r} was serialized for "
+                    f"encoding={layer.encoding_request!r} but compression={compression!r} "
+                    f"requires {requested_encoding!r}"
+                )
+            body_bytes = layer.body_bytes
             layer_header = {
                 "id": layer.layer_id,
                 "type": layer.layer_type,
                 "props": layer.props,
                 "byteOffset": body.tell(),
-                "byteLength": len(ipc_bytes),
+                "byteLength": len(body_bytes),
             }
+            # Omitted for plain IPC (the pre-existing encoding) so payloads
+            # from that path stay byte-identical with older frontend builds.
+            if layer.encoding != "ipc":
+                layer_header["bodyEncoding"] = layer.encoding
             if layer.extensions:
                 layer_header["extensions"] = layer.extensions
             if layer.tooltip_columns:
                 layer_header["tooltipColumns"] = layer.tooltip_columns
             layer_headers.append(layer_header)
-            body.write(ipc_bytes)
+            body.write(body_bytes)
 
         raw_body = body.getvalue()
         compressed_body, used_compression = _compress_body(raw_body, compression)
@@ -659,8 +875,8 @@ def check_payload_size(payload: bytes, *, max_mb: float) -> None:
             f"Streamlit's server.maxMessageSize limit of {max_mb}MB. To fix this:\n"
             "  - Downsample your data (fewer rows, coarser geometry) - usually the right fix "
             "for an interactive app.\n"
-            "  - Try compression='gzip' (see benchmarks/RESULTS.md for when this actually "
-            "helps - it isn't always a win).\n"
+            "  - Try compression='zstd' or 'parquet' (see benchmarks/RESULTS.md for when "
+            "each actually helps - none is always a win).\n"
             "  - Raise the limit by setting `server.maxMessageSize` in .streamlit/config.toml "
             "(increases memory/latency for every client, so prefer downsampling first)."
         )

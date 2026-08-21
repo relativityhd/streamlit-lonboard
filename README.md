@@ -143,17 +143,39 @@ below, or give one widget its comm back with
 
 ### Compression
 
-`st_lonboard(..., compression="auto" | "gzip" | None)` (default `"auto"`)
-gzips the Arrow payload above a 1MB threshold. **Measure before relying on
-this** — at 1M points it only shaved off ~11% (clustered *and* uniform-random
-data compressed about the same; gzip finds repeated byte sequences, not
-spatial/numeric proximity, so real GPS-precision coordinates don't compress
-much better than random ones) while costing ~900ms-1s of Python-side CPU plus
-~200ms of browser-side decompression per rerun — a net loss on localhost or
-any reasonably fast link, and only a likely win on slow/high-latency
-connections where the transfer savings outweigh that added CPU time. See
-[`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) for the numbers behind
-this. Pass `compression=None` to disable it outright.
+`st_lonboard(..., compression="auto" | "parquet" | "zstd" | "gzip" | None)`,
+default `"auto"`, controls how each layer's Arrow table travels to the
+browser. `"auto"` decides **per layer**, by table size:
+
+| layer size | ships as |
+| --- | --- |
+| under 1 MB | plain, near-zero-copy Arrow IPC |
+| 1–20 MB | ZSTD-compressed Arrow IPC |
+| 20 MB and up | Parquet (ZSTD + BYTE_STREAM_SPLIT), decoded by `parquet-wasm` |
+
+On real data (an Arctic EO cube on the A5 DGGS, 358k cells) the middle tier
+turns a 12.6 MB payload into 2.6 MB — 0.21× — for ~15 ms of Python and
+~23 ms of browser decode. Uniform-random synthetic coordinates compress far
+worse (0.91×), so **benchmark your own data** rather than either number.
+
+Parquet compresses ~20% better still, but costs roughly 3× the encode and
+decode time plus a one-time ~1.8 MB (gzipped, then browser-cached)
+`parquet-wasm` download — worth it only when bandwidth clearly dominates,
+which is why `"auto"` reserves it for the largest layers.
+
+Forcing a specific mode:
+
+| mode | use it when |
+| --- | --- |
+| `"zstd"` | you want compression below the 1 MB threshold too |
+| `"parquet"` | bandwidth-bound: smallest payload, at ~3× the CPU and a one-time WASM download |
+| `"gzip"` | compatibility only — superseded by `"zstd"` on size, encode, and decode |
+| `None` | purely local use, where transfer is free and any encode/decode is pure overhead |
+
+Apps whose layers all stay under 1 MB ship byte-identical payloads to
+previous versions, and only the top tier ever fetches the WASM. Full
+methodology and numbers:
+[`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md) (Phases 4h–4k).
 
 ### vs. `st.pydeck_chart` and `Map.to_html()`
 

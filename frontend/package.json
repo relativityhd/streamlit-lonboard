@@ -16,8 +16,10 @@
     "@deck.gl/mapbox": "^9.3.6",
     "@geoarrow/deck.gl-geoarrow": "^0.4.1",
     "@math.gl/polygon": "^4.1.0",
-    "apache-arrow": "^17.0.0",
-    "maplibre-gl": "^4.7.1"
+    "apache-arrow": "^21.2.0",
+    "maplibre-gl": "^4.7.1",
+    "parquet-wasm": "^0.7.2",
+    "zstddec": "^0.2.0"
   },
   "devDependencies": {
     "rollup-plugin-license": "^3.7.1",

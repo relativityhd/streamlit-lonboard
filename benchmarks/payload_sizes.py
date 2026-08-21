@@ -68,7 +68,10 @@ def lonboard_bytes(n: int) -> int:
         radius_units="meters",
         pickable=True,
     )
-    serialized = serialize_layer(layer, "layer-0")
+    # Explicit plain-IPC: this benchmark isolates the *format's* size from
+    # any compression (see the module docstring), so it must not follow the
+    # "auto" default, which would ship Parquet at these scales.
+    serialized = serialize_layer(layer, "layer-0", encoding="ipc")
     payload = pack_payload(
         [serialized], view_state=None, map_options={}, compression=None
     )
